@@ -116,14 +116,22 @@ class Blacklist(commands.Cog):
             await member.ban(reason="User is blacklisted")
 
     @app_commands.command()
+    @app_commands.describe(channel="The forum channel to set for blacklist applications")
     async def setforumchannel(self, interaction: discord.Interaction, channel: discord.ForumChannel):
         if interaction.user.id not in self.AUTHORIZED_USERS:
-            await interaction.response.send_message("You are not authorized to use this command.")
+            await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
             return
         
         self.config["forum_channel_id"] = channel.id
         self.save_config()
         await interaction.response.send_message(f"Forum channel for blacklist applications has been set to {channel.mention}")
+
+    @setforumchannel.error
+    async def setforumchannel_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.errors.TransformerError):
+            await interaction.response.send_message("The provided channel is not a forum channel. Please select a valid forum channel.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
 
     @commands.Cog.listener()
     async def on_thread_create(self, thread):
