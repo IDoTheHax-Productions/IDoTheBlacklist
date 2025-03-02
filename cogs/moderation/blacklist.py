@@ -92,7 +92,7 @@ class Blacklist(commands.Cog):
     Minecraft username (if applicable):
     Minecraft UUID (if applicable):
     Reason:"""
-        embed.add_field(name="Format", value=f"```" + format_text + "```", inline=False)
+        embed.add_field(name="Format", value=f"```" + embed + "```", inline=False)
         
         example = """
     Discord username: JohnDoe#1234
