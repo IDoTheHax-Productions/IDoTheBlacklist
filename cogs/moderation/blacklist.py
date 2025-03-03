@@ -163,7 +163,9 @@ Reason: Griefing and using hacks"""
                 if response.status == 200:
                     data = await response.json()
                     if data['blacklisted']:
-                        await member.ban(reason="User is blacklisted")
+                        reason = data.get('reason', 'No reason provided')
+                        await member.ban(reason=f"Blacklisted: {reason}")
+
 
     @commands.Cog.listener()
     async def on_thread_create(self, thread):
