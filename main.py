@@ -8,8 +8,6 @@ import json
 import os
 from dotenv import load_dotenv
 
-
-
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='/', intents=intents)
@@ -19,20 +17,6 @@ load_dotenv()
 
 # Access the token from the environment variable
 TOKEN = os.getenv("BOT_TOKEN")
-
-# Load blacklists from JSON files
-def load_blacklist(filename):
-    try:
-        with open(filename, 'r') as f:
-            return set(json.load(f))
-    except FileNotFoundError:
-        print(f"Warning: {filename} not found. Creating an empty file.")
-        with open(filename, 'w') as f:
-            json.dump([], f)
-        return set()
-
-BLACKLISTED_USERS = load_blacklist('blacklisted_users.json')
-BLACKLISTED_CHANNELS = load_blacklist('blacklisted_channels.json')
 
 async def load_cogs():
     for root, dirs, files in os.walk("./cogs"):  # Recursively walks through the cogs directory
@@ -58,8 +42,6 @@ async def on_ready():
     print(f"Views have been registered for {len(bot.guilds)} guilds.")
 
     try:
-        #BLACKLISTED_USERS = load_blacklist('blacklisted_users.json')
-        #BLACKLISTED_CHANNELS = load_blacklist('blacklisted_channels.json')
         synced = await bot.tree.sync()
 
         print(f"Synced {len(synced)} command(s)")
