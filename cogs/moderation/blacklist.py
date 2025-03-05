@@ -4,85 +4,285 @@ from discord.ext import commands
 import aiohttp
 import asyncio
 import re
-import os
-import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-class BlacklistModal(ui.Modal, title='Blacklist Confirmation'):
-    request_id = ui.TextInput(label='Request ID', placeholder='Enter the Request ID to confirm', required=True)
-
-    def __init__(self, cog):
+class ConfirmButton(ui.View):
+    def __init__(self, cog, blacklist_data):
         super().__init__()
         self.cog = cog
+        self.blacklist_data = blacklist_data
 
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)  # Acknowledge immediately
+    @ui.button(label='Confirm Blacklist', style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: ui.Button):
+        # First, defer the response to prevent interaction timeouts
+        await interaction.response.defer(ephemeral=True)
+        
+        if interaction.user.id not in self.cog.AUTHORIZED_USERS:
+            await interaction.followup.send("You are not authorized to confirm blacklist requests.", ephemeral=True)
+            return
 
+        # Extract user data
+        user_id = self.blacklist_data['discord_user_id']
+        username = self.blacklist_data['discord_username']
+        reason = self.blacklist_data['reason']
+        
+        # Create payload with the correct field names expected by the API
+        payload = {
+            'auth_id': interaction.user.id,
+            'user_id': user_id,
+            'display_name': username,
+            'reason': reason
+        }
+        
+        # Add Minecraft info if available
+        if self.blacklist_data.get('minecraft_username') or self.blacklist_data.get('minecraft_uuid'):
+            payload['mc_info'] = {
+                'username': self.blacklist_data.get('minecraft_username', ''),
+                'uuid': self.blacklist_data.get('minecraft_uuid', '')
+            }
+        
+        # Log the payload for debugging
+        print(f"Sending blacklist payload: {payload}")
+        
+        # Send the blacklist request to the API
         try:
-            request_id = int(self.request_id.value)
-            await self.cog.submit_blacklist(interaction, request_id) # Passing the request_id
-        except ValueError:
-            await interaction.followup.send("Invalid Request ID. Please enter a valid integer.", ephemeral=True)
+            async with aiohttp.ClientSession() as session:
+                async with session.post('http://localhost:5000/blacklist', json=payload) as response:
+                    if response.status != 200:
+                        response_text = await response.text()
+                        print(f"API Error: {response.status} - {response_text}")
+                        await interaction.followup.send(f"Failed to blacklist user. API returned: {response.status}", ephemeral=True)
+                        return
+                    else:
+                        # API request successful
+                        print("Blacklist API request successful")
         except Exception as e:
-            logging.exception("Error in BlacklistModal.on_submit")
-            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+            print(f"API request error: {e}")
+            await interaction.followup.send(f"Failed to connect to blacklist API: {str(e)}", ephemeral=True)
+            return
+        
+        # Process kicks and notifications
+        kicked_servers = []
+        mutual_servers = []
+        
+        try:
+            # Get user information
+            user = await self.cog.bot.fetch_user(int(user_id))
+            
+            # Find mutual servers
+            for guild in self.cog.bot.guilds:
+                member = guild.get_member(int(user_id))
+                if member:
+                    mutual_servers.append(guild.name)
+                    try:
+                        await member.kick(reason=f"Blacklisted: {reason}")
+                        kicked_servers.append(guild.name)
+                    except discord.Forbidden:
+                        print(f"Missing permissions to kick from {guild.name}")
+                    except Exception as e:
+                        print(f"Error kicking from {guild.name}: {e}")
+            
+            # Try to DM the user
+            if mutual_servers:
+                dm_message = f"Hello {user.display_name},\n\nYou have been blacklisted for the following reason: {reason}\n\n"
+                dm_message += "You were a member of the following servers:\n"
+                dm_message += "\n".join(mutual_servers)
+                
+                try:
+                    await user.send(dm_message)
+                    print(f"Successfully sent DM to {user.display_name}")
+                except discord.Forbidden:
+                    print(f"User {user.display_name} has DMs disabled")
+                except Exception as e:
+                    print(f"Error sending DM: {e}")
+        except Exception as e:
+            print(f"Error processing user actions: {e}")
+        
+        # Prepare success message
+        if kicked_servers:
+            kick_message = f"User {username} ({user_id}) has been blacklisted and kicked from the following servers:\n" + "\n".join(kicked_servers)
+        else:
+            kick_message = f"User {username} ({user_id}) has been blacklisted, but couldn't be kicked from any servers."
+        
+        # Add Minecraft info to message if available
+        if self.blacklist_data.get('minecraft_username'):
+            kick_message += f"\nMinecraft Username: {self.blacklist_data.get('minecraft_username')}"
+        if self.blacklist_data.get('minecraft_uuid'):
+            kick_message += f"\nMinecraft UUID: {self.blacklist_data.get('minecraft_uuid')}"
+        
+        # Update the message in the thread
+        try:
+            await interaction.message.edit(content=kick_message, embed=None, view=None)
+        except Exception as e:
+            print(f"Error updating message: {e}")
+            # Try to send a new message if editing fails
+            try:
+                await interaction.followup.send(kick_message, ephemeral=False)
+            except Exception as e2:
+                print(f"Error sending followup message: {e2}")
+        
+        # Send confirmation to the moderator
+        await interaction.followup.send("Blacklist operation completed successfully.", ephemeral=True)
+        self.stop()
+
+    @ui.button(label='Cancel', style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.edit_message(content="Blacklist action cancelled.", view=None)
+        self.stop()
 
 class Blacklist(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.AUTHORIZED_USERS = [int(user_id) for user_id in os.getenv("AUTHORIZED_USER_IDS", "").split(",")] # Load from environment variables
+        self.AUTHORIZED_USERS = [987323487343493191, 1088268266499231764, 726721909374320640, 710863981039845467, 1151136371164065904]
 
-        if not self.AUTHORIZED_USERS:
-            logging.warning("No authorized users found.  Please set the AUTHORIZED_USER_IDS environment variable.")
+    def get_correct_format_embed(self):
+        embed = discord.Embed(title="Correct Blacklist Request Format", color=discord.Color.blue())
+        embed.description = "Please use the following format in your thread description:"
+        
+        format_text = """
+Discord username:
+Discord user ID:
+Minecraft username (if applicable):
+Minecraft UUID (if applicable):
+Reason:"""
+        embed.add_field(name="Format", value=f"
+" + format_text + "
+", inline=False)
+        
+        example = """
+Discord username: JohnDoe#1234
+Discord user ID: 123456789012345678
+Minecraft username: JohnDoe123
+Minecraft UUID: 550e8400-e29b-41d4-a716-446655440000
+Reason: Griefing and using hacks"""
+        embed.add_field(name="Example", value=f"
+" + example + "
+", inline=False)
+        
+        return embed
 
-    async def cog_load(self):
-        logging.info(f"{self.__class__.__name__} cog loaded")
+    @commands.Cog.listener()
+    async def on_member_join(self, member):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f'http://localhost:5000/check_blacklist/{member.id}') as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data['blacklisted']:
+                        reason = data.get('reason', 'No reason provided')
+                        await member.ban(reason=f"Blacklisted: {reason}")
 
-    async def cog_unload(self):
-        logging.info(f"{self.__class__.__name__} cog unloaded")
 
-    async def submit_blacklist(self, interaction: discord.Interaction, request_id: int):
-        """This method calls the API and blacklists a user based on request ID."""
+    @commands.Cog.listener()
+    async def on_thread_create(self, thread):
+        if isinstance(thread.parent, discord.ForumChannel):
+            await asyncio.sleep(1)  # Wait for the initial message to be posted
+            
+            # Get the initial message
+            try:
+                starter_message = await thread.fetch_message(thread.id)
+                
+                # Only process blacklist requests in the appropriate channel
+                blacklist_channel_ids = [123456789012345678]  # Replace with your actual channel ID
+                if thread.parent.id not in blacklist_channel_ids:
+                    return
+                    
+                # Parse the request
+                blacklist_data = self.parse_blacklist_request(starter_message.content)
+                
+                # If parsing failed, send format guidance
+                if not blacklist_data:
+                    correct_format_embed = self.get_correct_format_embed()
+                    await thread.send(embed=correct_format_embed)
+                    return
+                
+                # Create and send the embed for a valid request
+                embed = discord.Embed(title="Blacklist Application", color=discord.Color.orange())
+                embed.add_field(name="Discord Username", value=blacklist_data['discord_username'], inline=False)
+                embed.add_field(name="Discord User ID", value=blacklist_data['discord_user_id'], inline=False)
+                embed.add_field(name="Reason", value=blacklist_data['reason'], inline=False)
+                
+                if blacklist_data.get('minecraft_username'):
+                    embed.add_field(name="Minecraft Username", value=blacklist_data['minecraft_username'], inline=False)
+                if blacklist_data.get('minecraft_uuid'):
+                    embed.add_field(name="Minecraft UUID", value=blacklist_data['minecraft_uuid'], inline=False)
+                
+                # Create and send the confirmation buttons
+                view = ConfirmButton(self, blacklist_data)
+                await thread.send(embed=embed, view=view)
+                
+            except discord.NotFound:
+                print(f"Could not find starter message for thread {thread.id}")
+            except Exception as e:
+                print(f"Error processing thread {thread.id}: {e}")
+
+    def parse_blacklist_request(self, content):
+        data = {}
+        
+        # Extract information using regex patterns
+        discord_username_pattern = r"Discord username:\s*([^\n]+)"
+        discord_id_pattern = r"Discord user ID:\s*(\d+)"
+        minecraft_username_pattern = r"Minecraft username(?:\s*\(if applicable\))?:\s*([^\n]+)"
+        minecraft_uuid_pattern = r"Minecraft UUID(?:\s*\(if applicable\))?:\s*([^\n]+)"
+        reason_pattern = r"Reason:\s*([\s\S]+)$"  # Match everything to the end
+        
+        # Extract using regex
+        username_match = re.search(discord_username_pattern, content, re.IGNORECASE)
+        id_match = re.search(discord_id_pattern, content, re.IGNORECASE)
+        mc_username_match = re.search(minecraft_username_pattern, content, re.IGNORECASE)
+        mc_uuid_match = re.search(minecraft_uuid_pattern, content, re.IGNORECASE)
+        reason_match = re.search(reason_pattern, content, re.IGNORECASE)
+        
+        # Populate data if matches found
+        if username_match:
+            data['discord_username'] = username_match.group(1).strip()
+        if id_match:
+            data['discord_user_id'] = id_match.group(1).strip()
+        if mc_username_match:
+            data['minecraft_username'] = mc_username_match.group(1).strip()
+        if mc_uuid_match:
+            data['minecraft_uuid'] = mc_uuid_match.group(1).strip()
+        if reason_match:
+            data['reason'] = reason_match.group(1).strip()
+        
+        # If we can't extract via regex, try a fallback for thread-title parsing
+        if not ('discord_username' in data and 'discord_user_id' in data):
+            # Try to extract from thread title format (username (ID))
+            title_match = re.match(r'(.*?)\s*\((\d+)\)', content.split('\n')[0])
+            if title_match:
+                data['discord_username'] = title_match.group(1).strip()
+                data['discord_user_id'] = title_match.group(2).strip()
+        
+        # Check if we have the minimum required data
+        if 'discord_username' in data and 'discord_user_id' in data and 'reason' in data:
+            return data
+        else:
+            return None
+
+    @commands.command(name="set_api_key")
+    @commands.is_owner()  # Ensure only the bot owner can set the API key
+    async def set_api_key(self, ctx, key: str):
+        """Set the API key for blacklist operations"""
+        # Delete the command message to not expose the API key
+        await ctx.message.delete()
+        
+        self.api_key = key
+        await ctx.send("API key updated successfully.", delete_after=5)
+
+    # Add a method to test the API connection
+    @commands.command(name="test_blacklist_api")
+    @commands.check(lambda ctx: ctx.author.id in [987323487343493191, 726721909374320640])
+    async def test_blacklist_api(self, ctx):
+        """Test the connection to the blacklist API"""
         try:
-            auth_id = int(os.getenv("AUTHORIZED_USER_ID"))  # From ENV
-            if interaction.user.id not in self.AUTHORIZED_USERS:
-                await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
-                return
-
-            payload = {
-                "request_id": int(request_id),
-                "auth_id": auth_id
-            }
-
             async with aiohttp.ClientSession() as session:
-                async with session.post('http://localhost:5000/process_blacklist', json=payload) as response:
-                    if response.status == 200:
-                        await interaction.followup.send(f"Blacklist request {request_id} processed successfully.", ephemeral=True)
-                    else:
-                        await interaction.followup.send(f"Failed to process blacklist request {request_id}. Status code: {response.status}", ephemeral=True)
-                        logging.error(f"API request failed with status code: {response.status} and payload: {payload}")
-
-        except ValueError:
-            await interaction.followup.send("Invalid Request ID. Please enter a valid integer.", ephemeral=True)
-        except aiohttp.ClientError as e:
-            logging.exception(f"AIOHTTP error during blacklist processing: {e}")
-            await interaction.followup.send(f"A network error occurred: {e}", ephemeral=True)
+                headers = {"X-API-Key": self.api_key}
+                async with session.get('http://localhost:5000/check_blacklist/test', 
+                                      headers=headers) as response:
+                    status = response.status
+                    response_text = await response.text()
+                    
+                    await ctx.send(f"API connection test:\nStatus: {status}\nResponse: {response_text[:1000]}")
         except Exception as e:
-            logging.exception("Error in submit_blacklist")
-            await interaction.followup.send(f"An unexpected error occurred: {e}", ephemeral=True)
-
-    @commands.command()
-    async def blacklist(self, ctx: commands.Context):
-        """Opens a modal to enter the Blacklist Request ID."""
-        if ctx.author.id not in self.AUTHORIZED_USERS:
-            await ctx.send("You are not authorized to use this command.")
-            return
-
-        modal = BlacklistModal(self)
-        await ctx.interaction.response.send_modal(modal)
-
-
+            await ctx.send(f"API connection test failed: {str(e)}")
+            
 async def setup(bot):
     await bot.add_cog(Blacklist(bot))
