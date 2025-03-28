@@ -268,6 +268,7 @@ Reason: Griefing and using hacks"""
         except Exception as e:
             await interaction.followup.send(f"Failed to sync commands: {str(e)}", ephemeral=True)
 
+<<<<<<< HEAD
     @app_commands.command(name="remove_from_blacklist", description="Remove a user from the blacklist by a specific field")
     @commands.check(lambda ctx: ctx.author.id in [987323487343493191, 1088268266499231764, 726721909374320640, 710863981039845467, 1151136371164065904])
     async def remove_from_blacklist(self, interaction: discord.Interaction, identifier: str, field: str = "user_id"):
@@ -298,5 +299,7 @@ Reason: Griefing and using hacks"""
             print(f"API request error: {e}")
             await interaction.followup.send(f"Failed to connect to blacklist API: {str(e)}", ephemeral=True)
 
+=======
+>>>>>>> 4d9643ed0a9500cf7be236f892ec295e2c4855ed
 async def setup(bot):
     await bot.add_cog(Blacklist(bot))
