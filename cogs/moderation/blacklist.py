@@ -32,112 +32,171 @@ class ConfirmButton(ui.View):
         username = self.blacklist_data['discord_username']
         reason = self.blacklist_data['reason']
 
-        payload = {
-            'auth_id': str(interaction.user.id),
-            'user_id': user_id,
-            'display_name': username,
-            'reason': reason
-        }
+        # First, send an initial status message
+        await interaction.followup.send(f"Processing blacklist for {username} ({user_id})...", ephemeral=True)
 
-        mc_info = {}
-        if self.blacklist_data.get('minecraft_username'):
-            mc_info['minecraft_username'] = self.blacklist_data['minecraft_username']
-            if not self.blacklist_data.get('minecraft_uuid'):
-                self.blacklist_data['minecraft_uuid'] = await self.cog.fetch_minecraft_uuid(mc_info['minecraft_username'])
-            mc_info['minecraft_uuid'] = self.blacklist_data.get('minecraft_uuid', '')
-            payload['mc_info'] = mc_info
-
-        print(f"Sending blacklist payload: {payload}")
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"X-API-Key": getattr(self.cog, 'api_key', 'unset')}
-                async with session.post('http://localhost:5000/blacklist', json=payload, headers=headers) as response:
-                    if response.status != 200:
-                        response_text = await response.text()
-                        print(f"API Error: {response.status} - {response_text}")
-                        await interaction.followup.send(f"Failed to blacklist user. API returned: {response.status}", ephemeral=True)
-                        return
-                    print("Blacklist API request successful")
-        except Exception as e:
-            print(f"API request error: {e}")
-            await interaction.followup.send(f"Failed to connect to blacklist API: {str(e)}", ephemeral=True)
-            return
-
-        # Process kicking and DM logic
         kicked_servers = []
         mutual_servers = []
+        owner_responses = {}  # To track the responses from owners
 
         try:
+            # Fetch the user object
             user = await self.cog.bot.fetch_user(int(user_id))
+            
+            # Log for debugging
+            print(f"Processing blacklist for user {username} ({user_id})")
+            
+            # First gather all mutual servers to avoid race conditions
             for guild in self.cog.bot.guilds:
                 member = guild.get_member(int(user_id))
                 if member:
-                    mutual_servers.append(guild.name)
-                    ## Dm The owner
-                    owner = guild.owner  # get guild owner
-                    dm_message = (
-                        f"Hellow {owner.display_name}, \n\n"
-                        f"This user `{username}` (ID: {user_id}) has been blacklist for the following reason: {reason}.\n"
-                        f"Do you approve kicking them from your server `{guild.name}`?\n\n"
-                        "Please reply with 'yes' or 'no'. You will be reminded within 24 hours, reminders will be sent."
-                    )
-                    try:
-                        await owner.send(dm_message)
-                        
-                        response = None
-                        for _ in range(24):
-                            def check(msg):
-                                return (
-                                    msg.author == owner
-                                    and msg.channel.type == discord.ChannelType.private
-                                    and msg.content.lower() in ['yes', 'no']
-                                )
+                    mutual_servers.append(guild)
+                    print(f"Found mutual server: {guild.name}")
+            
+            if not mutual_servers:
+                await interaction.followup.send(f"User {username} ({user_id}) is not in any mutual servers with the bot.", ephemeral=True)
+            
+            for guild in mutual_servers:
+                member = guild.get_member(int(user_id))
+                if not member:
+                    continue  # Skip if user is no longer in the server
+                
+                owner = guild.owner  # Get the guild owner
+                if not owner:
+                    print(f"Could not find owner for guild {guild.name}")
+                    continue
+                
+                # DM the guild owner for approval
+                dm_message = (
+                    f"Hello {owner.display_name},\n\n"
+                    f"The user `{username}` (ID: {user_id}) has been flagged for blacklisting for the following reason:\n"
+                    f"`{reason}`\n\n"
+                    f"Do you approve kicking them from your server `{guild.name}`?\n\n"
+                    "**Please reply with 'yes' or 'no'.**"
+                )
 
-                            try:
-                                response = await self.cog.bot.wait_for('message', timeout=3600, check=check)
-                                break
-                            except asyncio.TimeoutError:
-                                await owner.send(
-                                    f"Reminder: Please respond to the blacklist request for `{username}` in your server `{guild.name}`."
-                                )
-                        
-                        if not response:
-                            # Timeout after 24 hours
-                            await owner.send(f"No response recieved within 24 hours. `{username}` has not been kicked")
-                        
-                        if response.content.lower() == 'yes':
+                try:
+                    # Create a custom button view for the DM
+                    class DmResponseView(ui.View):
+                        def __init__(self):
+                            super().__init__(timeout=86400)  # 24 hour timeout
+                            self.response = None
+                            
+                        @ui.button(label='Yes, kick user', style=discord.ButtonStyle.danger)
+                        async def yes_button(self, dm_interaction: discord.Interaction, dm_button: ui.Button):
+                            self.response = "yes"
+                            await dm_interaction.response.edit_message(content=f"Thank you for your response. User `{username}` will be kicked from `{guild.name}`.")
+                            self.stop()
+                            
+                        @ui.button(label='No, do not kick', style=discord.ButtonStyle.secondary)
+                        async def no_button(self, dm_interaction: discord.Interaction, dm_button: ui.Button):
+                            self.response = "no"
+                            await dm_interaction.response.edit_message(content=f"Thank you for your response. User `{username}` will **not** be kicked from `{guild.name}`.")
+                            self.stop()
+                    
+                    # Create the view
+                    view = DmResponseView()
+                    
+                    # Send initial DM
+                    dm = await owner.send(dm_message, view=view)
+                    
+                    # Wait for button press
+                    await view.wait()
+                    if view.response:
+                        response = view.response
+                    else:
+                        # If timed out, send a follow-up message
+                        await owner.send(f"No response received within 24 hours. `{username}` has not been kicked from `{guild.name}`.")
+                        owner_responses[guild.id] = "timeout"
+                        continue
+                    
+                    # Process response
+                    if response == "yes":
+                        try:
+                            # Attempt to kick the user
                             await member.kick(reason=f"Blacklisted: {reason}")
                             kicked_servers.append(guild.name)
+                            await owner.send(f"User `{username}` has been successfully kicked from `{guild.name}`.")
+                            owner_responses[guild.id] = "approved"
+                        except discord.Forbidden:
+                            await owner.send(f"I don't have permission to kick `{username}` from `{guild.name}`. Please kick them manually.")
+                            owner_responses[guild.id] = "permission_error"
+                        except Exception as e:
+                            await owner.send(f"Error kicking `{username}` from `{guild.name}`: {e}")
+                            owner_responses[guild.id] = "error"
+                    else:
+                        await owner.send(f"User `{username}` will not be kicked from `{guild.name}`.")
+                        owner_responses[guild.id] = "denied"
 
-                        else:
-                            await owner.send(f"User `{username}` will not be kicked from `{guild.name}`.")
+                except discord.Forbidden:
+                    print(f"Could not DM the owner of {guild.name}.")
+                    owner_responses[guild.id] = "dm_blocked"
+                except Exception as e:
+                    print(f"Error sending DM to owner of {guild.name}: {e}")
+                    owner_responses[guild.id] = f"error: {str(e)}"
 
+            # Update the local blacklist database through the API
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {"X-API-Key": self.cog.api_key}
+                    payload = {
+                        "discord_user_id": user_id,
+                        "discord_username": username,
+                        "reason": reason
+                    }
                     
-                    except discord.Forbidden:
-                        print(f"Missing permissions to kick from {guild.name}")
-                    except Exception as e:
-                        print(f"Error kicking from {guild.name}: {e}")
+                    if self.blacklist_data.get('minecraft_username'):
+                        payload["minecraft_username"] = self.blacklist_data.get('minecraft_username')
+                    if self.blacklist_data.get('minecraft_uuid'):
+                        payload["minecraft_uuid"] = self.blacklist_data.get('minecraft_uuid')
+                        
+                    async with session.post('http://localhost:5000/blacklist/add', json=payload, headers=headers) as response:
+                        if response.status == 200:
+                            print(f"Successfully added {username} to API blacklist")
+                        else:
+                            print(f"Failed to add to API blacklist: {response.status}")
+            except Exception as e:
+                print(f"API blacklist error: {e}")
 
+            # Notify the blacklisted user
             if mutual_servers:
-                dm_message = f"Hello {user.display_name},\n\nYou have been blacklisted for the following reason: {reason}\n\n"
-                dm_message += "You were a member of the following servers:\n"
-                dm_message += "\n".join(mutual_servers)
+                user_dm_message = f"Hello {user.display_name},\n\nYou have been blacklisted for the following reason: {reason}\n\n"
+                if kicked_servers:
+                    user_dm_message += "You have been kicked from the following servers:\n"
+                    user_dm_message += "\n".join(kicked_servers)
+                else:
+                    user_dm_message += "The server owners have been notified of your blacklist status."
+                
                 try:
-                    await user.send(dm_message)
+                    await user.send(user_dm_message)
                     print(f"Successfully sent DM to {user.display_name}")
                 except discord.Forbidden:
                     print(f"User {user.display_name} has DMs disabled")
                 except Exception as e:
                     print(f"Error sending DM: {e}")
+            
         except Exception as e:
             print(f"Error processing user actions: {e}")
+            await interaction.followup.send(f"Error processing blacklist: {str(e)}", ephemeral=True)
+            return
 
         # Construct the updated message content
+        kick_message = f"User {username} ({user_id}) has been blacklisted."
         if kicked_servers:
-            kick_message = f"User {username} ({user_id}) has been blacklisted and kicked from:\n" + "\n".join(kicked_servers)
+            kick_message += f"\n\nKicked from servers:\n" + "\n".join(kicked_servers)
         else:
-            kick_message = f"User {username} ({user_id}) has been blacklisted, but couldn't be kicked from any servers."
+            kick_message += f"\n\nNot kicked from any servers."
+
+        if mutual_servers:
+            kick_message += f"\n\nMutual servers: {len(mutual_servers)}"
+        
+        # Add owner response summary
+        if owner_responses:
+            kick_message += "\n\nServer owner responses:"
+            for guild_id, response in owner_responses.items():
+                guild = self.cog.bot.get_guild(guild_id)
+                if guild:
+                    kick_message += f"\n- {guild.name}: {response}"
 
         if self.blacklist_data.get('minecraft_username'):
             kick_message += f"\nMinecraft Username: {self.blacklist_data.get('minecraft_username')}"
@@ -175,36 +234,54 @@ class Blacklist(commands.Cog):
         self.api_key = os.getenv("API_KEY", "unset")
         self.bot.add_view(ConfirmButton(self, {}, None))
         self.load_pending_blacklists()
+        
+        # Create data directory if it doesn't exist
+        os.makedirs("data", exist_ok=True)
 
     def load_pending_blacklists(self):
         """Load pending blacklist requests from file."""
         if os.path.exists(PENDING_FILE):
-            with open(PENDING_FILE, 'r') as f:
-                pending = json.load(f)
-                for message_id, data in pending.items():
-                    view = ConfirmButton(self, data, message_id)
-                    self.bot.add_view(view)  # Reattach view for each pending request
-            print(f"Loaded {len(pending)} pending blacklist requests.")
+            try:
+                with open(PENDING_FILE, 'r') as f:
+                    pending = json.load(f)
+                    for message_id, data in pending.items():
+                        view = ConfirmButton(self, data, message_id)
+                        self.bot.add_view(view)  # Reattach view for each pending request
+                print(f"Loaded {len(pending)} pending blacklist requests.")
+            except json.JSONDecodeError:
+                print("Error loading pending blacklists: Invalid JSON")
+                with open(PENDING_FILE, 'w') as f:
+                    json.dump({}, f)
+            except Exception as e:
+                print(f"Error loading pending blacklists: {e}")
+                with open(PENDING_FILE, 'w') as f:
+                    json.dump({}, f)
         else:
             with open(PENDING_FILE, 'w') as f:
                 json.dump({}, f)
     
     def save_pending_blacklist(self, message_id, blacklist_data):
         """Save a pending blacklist request to file."""
-        with open(PENDING_FILE, 'r') as f:
-            pending = json.load(f)
-        pending[message_id] = blacklist_data
-        with open(PENDING_FILE, 'w') as f:
-            json.dump(pending, f)
+        try:
+            with open(PENDING_FILE, 'r') as f:
+                pending = json.load(f)
+            pending[message_id] = blacklist_data
+            with open(PENDING_FILE, 'w') as f:
+                json.dump(pending, f)
+        except Exception as e:
+            print(f"Error saving pending blacklist: {e}")
     
     def remove_pending_blacklist(self, message_id):
         """Remove a pending blacklist request from file."""
-        with open(PENDING_FILE, 'r') as f:
-            pending = json.load(f)
-        if message_id in pending:
-            del pending[message_id]
-            with open(PENDING_FILE, 'w') as f:
-                json.dump(pending, f)
+        try:
+            with open(PENDING_FILE, 'r') as f:
+                pending = json.load(f)
+            if message_id in pending:
+                del pending[message_id]
+                with open(PENDING_FILE, 'w') as f:
+                    json.dump(pending, f)
+        except Exception as e:
+            print(f"Error removing pending blacklist: {e}")
 
     async def fetch_minecraft_uuid(self, username):
         url = f'https://api.mojang.com/users/profiles/minecraft/{username}'
@@ -236,16 +313,32 @@ Reason: Griefing and using hacks"""
 
     @commands.Cog.listener()
     async def on_member_join(self, member):
-        async with aiohttp.ClientSession() as session:
-            headers = {"X-API-Key": getattr(self, 'api_key', 'unset')}
-            async with session.get(f'http://localhost:5000/check_blacklist/{member.id}', headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data:
-                        reason = data.get('reason', 'No reason provided')
-                        await member.ban(reason=f"Blacklisted: {reason}")
-                else:
-                    print(f"Failed to check blacklist for {member.id}: {response.status}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"X-API-Key": getattr(self, 'api_key', 'unset')}
+                async with session.get(f'http://localhost:5000/check_blacklist/{member.id}', headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data:
+                            reason = data.get('reason', 'No reason provided')
+                            try:
+                                await member.ban(reason=f"Blacklisted: {reason}")
+                                print(f"Banned blacklisted user {member.name} from {member.guild.name}")
+                                
+                                # Log to a logging channel if one is set
+                                log_channel_id = getattr(self, 'log_channel_id', None)
+                                if log_channel_id:
+                                    log_channel = self.bot.get_channel(log_channel_id)
+                                    if log_channel:
+                                        await log_channel.send(f"📢 Banned blacklisted user {member.mention} ({member.id}) from {member.guild.name} for: {reason}")
+                            except discord.Forbidden:
+                                print(f"No permission to ban {member.name} from {member.guild.name}")
+                            except Exception as e:
+                                print(f"Error banning {member.name}: {e}")
+                    else:
+                        print(f"Failed to check blacklist for {member.id}: {response.status}")
+        except Exception as e:
+            print(f"Error checking blacklist for new member {member.id}: {e}")
 
     @commands.Cog.listener()
     async def on_thread_create(self, thread):
@@ -317,18 +410,37 @@ Reason: Griefing and using hacks"""
         return None
 
     @app_commands.command(name="set_api_key", description="Set the API key for blacklist operations (owner only)")
-    @commands.is_owner()
+    @app_commands.default_permissions(administrator=True)
     async def set_api_key(self, interaction: discord.Interaction, key: str):
         await interaction.response.defer(ephemeral=True)
+        if interaction.user.id not in self.AUTHORIZED_USERS:
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
+            
         # Update the environment variable (optional, only if you want to persist it this way)
         os.environ["API_KEY"] = key
         self.api_key = key  # Update the cog's instance variable
         await interaction.followup.send("API key updated successfully.", ephemeral=True)
 
+    @app_commands.command(name="set_log_channel", description="Set the channel for blacklist logs")
+    @app_commands.default_permissions(administrator=True)
+    async def set_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.user.id not in self.AUTHORIZED_USERS:
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
+            
+        self.log_channel_id = channel.id
+        await interaction.followup.send(f"Log channel set to {channel.mention}", ephemeral=True)
+
     @app_commands.command(name="test_blacklist_api", description="Test the blacklist API connection")
-    @commands.check(lambda ctx: ctx.author.id in [987323487343493191, 726721909374320640])
+    @app_commands.default_permissions(administrator=True)
     async def test_blacklist_api(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        if interaction.user.id not in self.AUTHORIZED_USERS:
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
+            
         # Log the API key being used
         print(f"API Key being used: {getattr(self, 'api_key', 'unset')}")
         try:
@@ -342,9 +454,13 @@ Reason: Griefing and using hacks"""
             await interaction.followup.send(f"API connection test failed: {str(e)}", ephemeral=True)
 
     @app_commands.command(name="sync_commands", description="Sync bot commands with Discord (owner only)")
-    @commands.is_owner()
+    @app_commands.default_permissions(administrator=True)
     async def sync_commands(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        if interaction.user.id not in self.AUTHORIZED_USERS:
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
+            
         try:
             await self.bot.tree.sync()
             await interaction.followup.send("Commands synced successfully.", ephemeral=True)
@@ -352,9 +468,12 @@ Reason: Griefing and using hacks"""
             await interaction.followup.send(f"Failed to sync commands: {str(e)}", ephemeral=True)
 
     @app_commands.command(name="remove_from_blacklist", description="Remove a user from the blacklist by a specific field")
-    @commands.check(lambda ctx: ctx.author.id in [987323487343493191, 1088268266499231764, 726721909374320640, 710863981039845467, 1151136371164065904])
+    @app_commands.default_permissions(administrator=True)
     async def remove_from_blacklist(self, interaction: discord.Interaction, identifier: str, field: str = "user_id"):
         await interaction.response.defer(ephemeral=True)
+        if interaction.user.id not in self.AUTHORIZED_USERS:
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
 
         if field not in ["user_id", "minecraft_uuid"]:
             await interaction.followup.send("Invalid field. Use 'user_id' or 'minecraft_uuid'.", ephemeral=True)
@@ -381,6 +500,73 @@ Reason: Griefing and using hacks"""
             print(f"API request error: {e}")
             await interaction.followup.send(f"Failed to connect to blacklist API: {str(e)}", ephemeral=True)
 
+    @app_commands.command(name="force_blacklist", description="Immediately blacklist a user without server owner approval")
+    @app_commands.default_permissions(administrator=True)
+    async def force_blacklist(self, interaction: discord.Interaction, user_id: str, reason: str, kick_from_servers: bool = True):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.user.id not in self.AUTHORIZED_USERS:
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
+            
+        try:
+            # Validate user_id format
+            if not user_id.isdigit():
+                await interaction.followup.send("User ID must be numeric.", ephemeral=True)
+                return
+                
+            user_id = int(user_id)
+            
+            # Try to fetch user
+            try:
+                user = await self.bot.fetch_user(user_id)
+                username = user.name
+            except discord.NotFound:
+                username = f"Unknown User {user_id}"
+            except Exception as e:
+                await interaction.followup.send(f"Error fetching user: {e}", ephemeral=True)
+                return
+                
+            # Add to API blacklist
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {"X-API-Key": getattr(self, 'api_key', 'unset')}
+                    payload = {
+                        "discord_user_id": str(user_id),
+                        "discord_username": username,
+                        "reason": reason
+                    }
+                    
+                    async with session.post('http://localhost:5000/blacklist/add', json=payload, headers=headers) as response:
+                        if response.status != 200:
+                            await interaction.followup.send(f"Warning: Failed to add to API blacklist database. Status: {response.status}", ephemeral=True)
+            except Exception as e:
+                await interaction.followup.send(f"Warning: Failed to connect to blacklist API: {e}", ephemeral=True)
+                
+            # Kick from servers if requested
+            kicked_servers = []
+            if kick_from_servers:
+                for guild in self.bot.guilds:
+                    member = guild.get_member(user_id)
+                    if member:
+                        try:
+                            await member.kick(reason=f"Force blacklisted: {reason}")
+                            kicked_servers.append(guild.name)
+                        except discord.Forbidden:
+                            print(f"No permission to kick {username} from {guild.name}")
+                        except Exception as e:
+                            print(f"Error kicking {username} from {guild.name}: {e}")
+            
+            # Prepare response message
+            response = f"User {username} ({user_id}) has been blacklisted for: {reason}"
+            if kicked_servers:
+                response += f"\n\nKicked from servers:\n" + "\n".join(kicked_servers)
+            else:
+                response += "\n\nNot kicked from any servers."
+                
+            await interaction.followup.send(response, ephemeral=True)
+            
+        except Exception as e:
+            await interaction.followup.send(f"Error processing force blacklist: {e}", ephemeral=True)
+
 async def setup(bot):
     await bot.add_cog(Blacklist(bot))
-
