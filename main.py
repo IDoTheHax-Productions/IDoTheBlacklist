@@ -16,7 +16,7 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 load_dotenv()
 
 # Access the token from the environment variable
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("DISCORD_BOT_TOKEN_BLACKLIST")
 
 async def load_cogs():
     for root, dirs, files in os.walk("./cogs"):  # Recursively walks through the cogs directory

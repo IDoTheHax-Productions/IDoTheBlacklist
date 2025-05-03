@@ -69,9 +69,46 @@ class ConfirmButton(ui.View):
                 member = guild.get_member(int(user_id))
                 if member:
                     mutual_servers.append(guild.name)
+                    ## Dm The owner
+                    owner = guild.owner  # get guild owner
+                    dm_message = (
+                        f"Hellow {owner.display_name}, \n\n"
+                        f"This user `{username}` (ID: {user_id}) has been blacklist for the following reason: {reason}.\n"
+                        f"Do you approve kicking them from your server `{guild.name}`?\n\n"
+                        "Please reply with 'yes' or 'no'. You will be reminded within 24 hours, reminders will be sent."
+                    )
                     try:
-                        await member.kick(reason=f"Blacklisted: {reason}")
-                        kicked_servers.append(guild.name)
+                        await owner.send(dm_message)
+                        
+                        response = None
+                        for _ in range(24):
+                            def check(msg):
+                                return (
+                                    msg.author == owner
+                                    and msg.channel.type == discord.ChannelType.private
+                                    and msg.content.lower() in ['yes', 'no']
+                                )
+
+                            try:
+                                response = await self.cog.bot.wait_for('message', timeout=3600, check=check)
+                                break
+                            except asyncio.TimeoutError:
+                                await owner.send(
+                                    f"Reminder: Please respond to the blacklist request for `{username}` in your server `{guild.name}`."
+                                )
+                        
+                        if not response:
+                            # Timeout after 24 hours
+                            await owner.send(f"No response recieved within 24 hours. `{username}` has not been kicked")
+                        
+                        if response.content.lower() == 'yes':
+                            await member.kick(reason=f"Blacklisted: {reason}")
+                            kicked_servers.append(guild.name)
+
+                        else:
+                            await owner.send(f"User `{username}` will not be kicked from `{guild.name}`.")
+
+                    
                     except discord.Forbidden:
                         print(f"Missing permissions to kick from {guild.name}")
                     except Exception as e:
@@ -121,7 +158,7 @@ class ConfirmButton(ui.View):
 class Blacklist(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.AUTHORIZED_USERS = [987323487343493191, 1088268266499231764, 726721909374320640, 710863981039845467, 1151136371164065904]
+        self.AUTHORIZED_USERS = [1362041490779672576, 1088268266499231764, 726721909374320640, 710863981039845467, 1151136371164065904]
         # Load the API key from the environment variable
         self.api_key = os.getenv("API_KEY", "unset")
 
