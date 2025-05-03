@@ -10,13 +10,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# File to store pending blacklist requests
+PENDING_FILE = "data/pending_blacklists.json"
+
 class ConfirmButton(ui.View):
-    def __init__(self, cog, blacklist_data):
-        super().__init__()
+    def __init__(self, cog, blacklist_data, message_id=None):
+        super().__init__(timeout=None)  # No timeout for persistent views
         self.cog = cog
         self.blacklist_data = blacklist_data
+        self.message_id = message_id  # Track the message this view is tied to
 
-    @ui.button(label='Confirm Blacklist', style=discord.ButtonStyle.danger)
+    @ui.button(label='Confirm Blacklist', style=discord.ButtonStyle.danger, custom_id="confirm_blacklist")
     async def confirm(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer(ephemeral=True)
 
@@ -60,6 +64,7 @@ class ConfirmButton(ui.View):
             await interaction.followup.send(f"Failed to connect to blacklist API: {str(e)}", ephemeral=True)
             return
 
+        # Process kicking and DM logic
         kicked_servers = []
         mutual_servers = []
 
@@ -128,6 +133,7 @@ class ConfirmButton(ui.View):
         except Exception as e:
             print(f"Error processing user actions: {e}")
 
+        # Construct the updated message content
         if kicked_servers:
             kick_message = f"User {username} ({user_id}) has been blacklisted and kicked from:\n" + "\n".join(kicked_servers)
         else:
@@ -138,21 +144,27 @@ class ConfirmButton(ui.View):
         if self.blacklist_data.get('minecraft_uuid'):
             kick_message += f"\nMinecraft UUID: {self.blacklist_data.get('minecraft_uuid')}"
 
+        # Update the original message
         try:
             await interaction.message.edit(content=kick_message, embed=None, view=None)
+            self.cog.remove_pending_blacklist(self.message_id)
+        except discord.NotFound:
+            print(f"Original message {self.message_id} not found for editing.")
+            await interaction.followup.send(kick_message, ephemeral=False)
+        except discord.Forbidden:
+            print(f"Bot lacks permission to edit message {self.message_id}.")
+            await interaction.followup.send(kick_message, ephemeral=False)
         except Exception as e:
-            print(f"Error updating message: {e}")
-            try:
-                await interaction.followup.send(kick_message, ephemeral=False)
-            except Exception as e2:
-                print(f"Error sending followup message: {e2}")
+            print(f"Error updating message {self.message_id}: {e}")
+            await interaction.followup.send(kick_message, ephemeral=False)
 
         await interaction.followup.send("Blacklist operation completed successfully.", ephemeral=True)
         self.stop()
 
-    @ui.button(label='Cancel', style=discord.ButtonStyle.secondary)
+    @ui.button(label='Cancel', style=discord.ButtonStyle.secondary, custom_id="cancel_blacklist")
     async def cancel(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.edit_message(content="Blacklist action cancelled.", view=None)
+        self.cog.remove_pending_blacklist(self.message_id)  # Remove from pending on cancel
         self.stop()
 
 class Blacklist(commands.Cog):
@@ -161,6 +173,38 @@ class Blacklist(commands.Cog):
         self.AUTHORIZED_USERS = [1362041490779672576, 1088268266499231764, 726721909374320640, 710863981039845467, 1151136371164065904]
         # Load the API key from the environment variable
         self.api_key = os.getenv("API_KEY", "unset")
+        self.bot.add_view(ConfirmButton(self, {}, None))
+        self.load_pending_blacklists()
+
+    def load_pending_blacklists(self):
+        """Load pending blacklist requests from file."""
+        if os.path.exists(PENDING_FILE):
+            with open(PENDING_FILE, 'r') as f:
+                pending = json.load(f)
+                for message_id, data in pending.items():
+                    view = ConfirmButton(self, data, message_id)
+                    self.bot.add_view(view)  # Reattach view for each pending request
+            print(f"Loaded {len(pending)} pending blacklist requests.")
+        else:
+            with open(PENDING_FILE, 'w') as f:
+                json.dump({}, f)
+    
+    def save_pending_blacklist(self, message_id, blacklist_data):
+        """Save a pending blacklist request to file."""
+        with open(PENDING_FILE, 'r') as f:
+            pending = json.load(f)
+        pending[message_id] = blacklist_data
+        with open(PENDING_FILE, 'w') as f:
+            json.dump(pending, f)
+    
+    def remove_pending_blacklist(self, message_id):
+        """Remove a pending blacklist request from file."""
+        with open(PENDING_FILE, 'r') as f:
+            pending = json.load(f)
+        if message_id in pending:
+            del pending[message_id]
+            with open(PENDING_FILE, 'w') as f:
+                json.dump(pending, f)
 
     async def fetch_minecraft_uuid(self, username):
         url = f'https://api.mojang.com/users/profiles/minecraft/{username}'
@@ -197,7 +241,7 @@ Reason: Griefing and using hacks"""
             async with session.get(f'http://localhost:5000/check_blacklist/{member.id}', headers=headers) as response:
                 if response.status == 200:
                     data = await response.json()
-                    if data:  # Check if data indicates blacklisted (assuming non-empty dict means blacklisted)
+                    if data:
                         reason = data.get('reason', 'No reason provided')
                         await member.ban(reason=f"Blacklisted: {reason}")
                 else:
@@ -229,7 +273,9 @@ Reason: Griefing and using hacks"""
                     embed.add_field(name="Minecraft UUID", value=blacklist_data['minecraft_uuid'], inline=False)
 
                 view = ConfirmButton(self, blacklist_data)
-                await thread.send(embed=embed, view=view)
+                message = await thread.send(embed=embed, view=view)
+                self.save_pending_blacklist(str(message.id), blacklist_data)  # Save pending request
+                view.message_id = str(message.id)  # Assign message ID to view
             except discord.NotFound:
                 print(f"Could not find starter message for thread {thread.id}")
             except Exception as e:
@@ -305,5 +351,36 @@ Reason: Griefing and using hacks"""
         except Exception as e:
             await interaction.followup.send(f"Failed to sync commands: {str(e)}", ephemeral=True)
 
+    @app_commands.command(name="remove_from_blacklist", description="Remove a user from the blacklist by a specific field")
+    @commands.check(lambda ctx: ctx.author.id in [987323487343493191, 1088268266499231764, 726721909374320640, 710863981039845467, 1151136371164065904])
+    async def remove_from_blacklist(self, interaction: discord.Interaction, identifier: str, field: str = "user_id"):
+        await interaction.response.defer(ephemeral=True)
+
+        if field not in ["user_id", "minecraft_uuid"]:
+            await interaction.followup.send("Invalid field. Use 'user_id' or 'minecraft_uuid'.", ephemeral=True)
+            return
+
+        payload = {
+            "identifier": identifier,
+            "field": field
+        }
+
+        print(f"Sending remove blacklist payload: {payload}")
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"X-API-Key": getattr(self, 'api_key', 'unset')}
+                async with session.post('http://localhost:5000/blacklist/remove', json=payload, headers=headers) as response:
+                    response_text = await response.text()
+                    if response.status == 200:
+                        await interaction.followup.send(f"Successfully removed user with {field}={identifier} from blacklist.", ephemeral=True)
+                    else:
+                        print(f"API Error: {response.status} - {response_text}")
+                        await interaction.followup.send(f"Failed to remove from blacklist. API returned: {response.status} - {response_text}", ephemeral=True)
+        except Exception as e:
+            print(f"API request error: {e}")
+            await interaction.followup.send(f"Failed to connect to blacklist API: {str(e)}", ephemeral=True)
+
 async def setup(bot):
     await bot.add_cog(Blacklist(bot))
+
