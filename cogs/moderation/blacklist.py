@@ -37,22 +37,21 @@ class ConfirmButton(ui.View):
 
         kicked_servers = []
         mutual_servers = []
-        owner_responses = {}  # To track the responses from owners
 
         try:
             # Fetch the user object
             user = await self.cog.bot.fetch_user(int(user_id))
-            
+
             # Log for debugging
             print(f"Processing blacklist for user {username} ({user_id})")
-            
+
             # First gather all mutual servers to avoid race conditions
             # Force the bot to fetch members for all guilds to avoid caching issues
             for guild in self.cog.bot.guilds:
                 try:
                     # Try to get the member from cache first
                     member = guild.get_member(int(user_id))
-                    
+
                     if not member:
                         # If not in cache, force fetch the member
                         try:
@@ -62,95 +61,92 @@ class ConfirmButton(ui.View):
                             member = None
                         except discord.HTTPException as e:
                             print(f"HTTP error when fetching member in {guild.name}: {e}")
-                    
+
                     if member:
                         mutual_servers.append(guild)
                         print(f"Found mutual server: {guild.name}")
+
                 except Exception as e:
                     print(f"Error checking membership in {guild.name}: {e}")
-            
-            # Continue even if no mutual servers are found
-            if not mutual_servers:
-                await interaction.followup.send(f"Warning: User {username} ({user_id}) could not be found in any mutual servers. Continuing with blacklist process anyway.", ephemeral=True)
-            
-            for guild in mutual_servers:
-                member = guild.get_member(int(user_id))
-                if not member:
-                    continue  # Skip if user is no longer in the server
-                
-                owner = guild.owner  # Get the guild owner
-                if not owner:
-                    print(f"Could not find owner for guild {guild.name}")
-                    continue
-                
-                # DM the guild owner for approval
-                dm_message = (
-                    f"Hello {owner.display_name},\n\n"
-                    f"The user `{username}` (ID: {user_id}) has been flagged for blacklisting for the following reason:\n"
-                    f"`{reason}`\n\n"
-                    f"Do you approve kicking them from your server `{guild.name}`?\n\n"
-                    "**Please reply with 'yes' or 'no'.**"
-                )
 
+            # Dm The owner
+            for guild in mutual_servers:
                 try:
-                    # Create a custom button view for the DM
-                    class DmResponseView(ui.View):
-                        def __init__(self):
-                            super().__init__(timeout=86400)  # 24 hour timeout
-                            self.response = None
-                            
-                        @ui.button(label='Yes, kick user', style=discord.ButtonStyle.danger)
-                        async def yes_button(self, dm_interaction: discord.Interaction, dm_button: ui.Button):
-                            self.response = "yes"
-                            await dm_interaction.response.edit_message(content=f"Thank you for your response. User `{username}` will be kicked from `{guild.name}`.")
-                            self.stop()
-                            
-                        @ui.button(label='No, do not kick', style=discord.ButtonStyle.secondary)
-                        async def no_button(self, dm_interaction: discord.Interaction, dm_button: ui.Button):
-                            self.response = "no"
-                            await dm_interaction.response.edit_message(content=f"Thank you for your response. User `{username}` will **not** be kicked from `{guild.name}`.")
-                            self.stop()
-                    
-                    # Create the view
-                    view = DmResponseView()
-                    
-                    # Send initial DM
-                    dm = await owner.send(dm_message, view=view)
-                    
-                    # Wait for button press
-                    await view.wait()
-                    if view.response:
-                        response = view.response
-                    else:
-                        # If timed out, send a follow-up message
-                        await owner.send(f"No response received within 24 hours. `{username}` has not been kicked from `{guild.name}`.")
-                        owner_responses[guild.id] = "timeout"
+                    member = guild.get_member(int(user_id))
+                    if not member:
+                        try:
+                            member = await guild.fetch_member(int(user_id))
+                        except discord.NotFound:
+                            print(f"User {username} not found in {guild.name} (even after fetch), skipping")
+                            continue
+                        except Exception as e:
+                            print(f"Error fetching member {username} in {guild.name}: {e}")
+                            continue
+
+
+                    if not member:
+                        print(f"User {username} not found in {guild.name}, skipping")
+                        continue
+
+                    print(f"Processing guild: {guild}")  # ADDED PRINT STATEMENT
+
+                    try:
+                        owner_id = guild.owner_id
+                        owner = await guild.fetch_member(owner_id)  # get guild owner
+                        if owner is None:
+                            print(f"ERROR: Owner is None for guild {guild.name} (ID: {guild.id})")
+                            continue
+                        print(f"Owner found: Name={owner.name}, ID={owner.id}")
+                        dm_message = (
+                            f"Hello {owner.display_name}, \n\n"
+                            f"This user `{username}` (ID: {user_id}) has been blacklisted for the following reason: {reason}.\n"
+                            f"Do you approve kicking them from your server `{guild.name}`?\n\n"
+                            "Please reply with 'yes' or 'no'. You will be reminded within 24 hours, reminders will be sent."
+                        )
+                    except Exception as e:
+                        print(f"Error getting owner or creating DM for guild {guild.name}: {e}")
                         continue
                     
-                    # Process response
-                    if response == "yes":
-                        try:
-                            # Attempt to kick the user
+                    try:
+                        await owner.send(dm_message)
+
+                        response = None
+                        for _ in range(24):
+                            def check(msg):
+                                return (
+                                    msg.author == owner
+                                    and msg.channel.type == discord.ChannelType.private
+                                    and msg.content.lower() in ['yes', 'no']
+                                )
+
+                            try:
+                                response = await self.cog.bot.wait_for('message', timeout=3600, check=check)
+                                break
+                            except asyncio.TimeoutError:
+                                await owner.send(
+                                    f"Reminder: Please respond to the blacklist request for `{username}` in your server `{guild.name}`."
+                                )
+
+                        if not response:
+                            # Timeout after 24 hours
+                            await owner.send(f"No response recieved within 24 hours. `{username}` has not been kicked")
+
+                        if response and response.content.lower() == 'yes':
                             await member.kick(reason=f"Blacklisted: {reason}")
                             kicked_servers.append(guild.name)
-                            await owner.send(f"User `{username}` has been successfully kicked from `{guild.name}`.")
-                            owner_responses[guild.id] = "approved"
-                        except discord.Forbidden:
-                            await owner.send(f"I don't have permission to kick `{username}` from `{guild.name}`. Please kick them manually.")
-                            owner_responses[guild.id] = "permission_error"
-                        except Exception as e:
-                            await owner.send(f"Error kicking `{username}` from `{guild.name}`: {e}")
-                            owner_responses[guild.id] = "error"
-                    else:
-                        await owner.send(f"User `{username}` will not be kicked from `{guild.name}`.")
-                        owner_responses[guild.id] = "denied"
 
-                except discord.Forbidden:
-                    print(f"Could not DM the owner of {guild.name}.")
-                    owner_responses[guild.id] = "dm_blocked"
+                        else:
+                            await owner.send(f"User `{username}` will not be kicked from `{guild.name}`.")
+
+
+                    except discord.Forbidden:
+                        print(f"Missing permissions to DM owner in {guild.name}")
+                    except Exception as e:
+                        print(f"Error sending DM or waiting for response in {guild.name}: {e}")
                 except Exception as e:
-                    print(f"Error sending DM to owner of {guild.name}: {e}")
-                    owner_responses[guild.id] = f"error: {str(e)}"
+                    print(f"Error processing guild {guild.name}: {e}")
+                                
+            print("GOT YOU RUNNING")
 
             # Update the local blacklist database through the API
             try:
@@ -161,13 +157,13 @@ class ConfirmButton(ui.View):
                         "discord_username": username,
                         "reason": reason
                     }
-                    
+
                     if self.blacklist_data.get('minecraft_username'):
                         payload["minecraft_username"] = self.blacklist_data.get('minecraft_username')
                     if self.blacklist_data.get('minecraft_uuid'):
                         payload["minecraft_uuid"] = self.blacklist_data.get('minecraft_uuid')
-                        
-                    async with session.post('http://localhost:5000/blacklist/add', json=payload, headers=headers) as response:
+
+                    async with session.post('http://localhost:5000/blacklist', json=payload, headers=headers) as response:
                         if response.status == 200:
                             print(f"Successfully added {username} to API blacklist")
                         else:
@@ -183,7 +179,7 @@ class ConfirmButton(ui.View):
                     user_dm_message += "\n".join(kicked_servers)
                 else:
                     user_dm_message += "The server owners have been notified of your blacklist status."
-                
+
                 try:
                     await user.send(user_dm_message)
                     print(f"Successfully sent DM to {user.display_name}")
@@ -191,7 +187,7 @@ class ConfirmButton(ui.View):
                     print(f"User {user.display_name} has DMs disabled")
                 except Exception as e:
                     print(f"Error sending DM: {e}")
-            
+
         except Exception as e:
             print(f"Error processing user actions: {e}")
             await interaction.followup.send(f"Error processing blacklist: {str(e)}", ephemeral=True)
@@ -203,22 +199,6 @@ class ConfirmButton(ui.View):
             kick_message += f"\n\nKicked from servers:\n" + "\n".join(kicked_servers)
         else:
             kick_message += f"\n\nNot kicked from any servers."
-
-        if mutual_servers:
-            kick_message += f"\n\nMutual servers: {len(mutual_servers)}"
-        
-        # Add owner response summary
-        if owner_responses:
-            kick_message += "\n\nServer owner responses:"
-            for guild_id, response in owner_responses.items():
-                guild = self.cog.bot.get_guild(guild_id)
-                if guild:
-                    kick_message += f"\n- {guild.name}: {response}"
-
-        if self.blacklist_data.get('minecraft_username'):
-            kick_message += f"\nMinecraft Username: {self.blacklist_data.get('minecraft_username')}"
-        if self.blacklist_data.get('minecraft_uuid'):
-            kick_message += f"\nMinecraft UUID: {self.blacklist_data.get('minecraft_uuid')}"
 
         # Update the original message
         try:
@@ -580,7 +560,7 @@ Reason: Griefing and using hacks"""
                         "reason": reason
                     }
                     
-                    async with session.post('http://localhost:5000/blacklist/add', json=payload, headers=headers) as response:
+                    async with session.post('http://localhost:5000/blacklist', json=payload, headers=headers) as response:
                         if response.status != 200:
                             await interaction.followup.send(f"Warning: Failed to add to API blacklist database. Status: {response.status}", ephemeral=True)
             except Exception as e:
