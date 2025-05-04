@@ -47,14 +47,31 @@ class ConfirmButton(ui.View):
             print(f"Processing blacklist for user {username} ({user_id})")
             
             # First gather all mutual servers to avoid race conditions
+            # Force the bot to fetch members for all guilds to avoid caching issues
             for guild in self.cog.bot.guilds:
-                member = guild.get_member(int(user_id))
-                if member:
-                    mutual_servers.append(guild)
-                    print(f"Found mutual server: {guild.name}")
+                try:
+                    # Try to get the member from cache first
+                    member = guild.get_member(int(user_id))
+                    
+                    if not member:
+                        # If not in cache, force fetch the member
+                        try:
+                            member = await guild.fetch_member(int(user_id))
+                        except discord.NotFound:
+                            # User is not in this guild
+                            member = None
+                        except discord.HTTPException as e:
+                            print(f"HTTP error when fetching member in {guild.name}: {e}")
+                    
+                    if member:
+                        mutual_servers.append(guild)
+                        print(f"Found mutual server: {guild.name}")
+                except Exception as e:
+                    print(f"Error checking membership in {guild.name}: {e}")
             
+            # Continue even if no mutual servers are found
             if not mutual_servers:
-                await interaction.followup.send(f"User {username} ({user_id}) is not in any mutual servers with the bot.", ephemeral=True)
+                await interaction.followup.send(f"Warning: User {username} ({user_id}) could not be found in any mutual servers. Continuing with blacklist process anyway.", ephemeral=True)
             
             for guild in mutual_servers:
                 member = guild.get_member(int(user_id))
@@ -313,28 +330,55 @@ Reason: Griefing and using hacks"""
 
     @commands.Cog.listener()
     async def on_member_join(self, member):
+        # Print log message for debugging
+        print(f"New member joined: {member.name} ({member.id}) in server {member.guild.name}")
+        
         try:
             async with aiohttp.ClientSession() as session:
                 headers = {"X-API-Key": getattr(self, 'api_key', 'unset')}
-                async with session.get(f'http://localhost:5000/check_blacklist/{member.id}', headers=headers) as response:
+                api_url = f'http://localhost:5000/check_blacklist/{member.id}'
+                
+                # Debug log
+                print(f"Checking blacklist API: {api_url}")
+                
+                async with session.get(api_url, headers=headers) as response:
+                    print(f"API response status: {response.status}")
+                    
                     if response.status == 200:
-                        data = await response.json()
-                        if data:
-                            reason = data.get('reason', 'No reason provided')
-                            try:
-                                await member.ban(reason=f"Blacklisted: {reason}")
-                                print(f"Banned blacklisted user {member.name} from {member.guild.name}")
+                        response_text = await response.text()
+                        print(f"API response: {response_text}")
+                        
+                        try:
+                            data = await response.json()
+                            if data:
+                                reason = data.get('reason', 'No reason provided')
+                                print(f"User {member.name} is blacklisted for: {reason}")
                                 
-                                # Log to a logging channel if one is set
-                                log_channel_id = getattr(self, 'log_channel_id', None)
-                                if log_channel_id:
-                                    log_channel = self.bot.get_channel(log_channel_id)
-                                    if log_channel:
-                                        await log_channel.send(f"📢 Banned blacklisted user {member.mention} ({member.id}) from {member.guild.name} for: {reason}")
-                            except discord.Forbidden:
-                                print(f"No permission to ban {member.name} from {member.guild.name}")
-                            except Exception as e:
-                                print(f"Error banning {member.name}: {e}")
+                                try:
+                                    await member.ban(reason=f"Blacklisted: {reason}")
+                                    print(f"Banned blacklisted user {member.name} from {member.guild.name}")
+                                    
+                                    # Log to a logging channel if one is set
+                                    log_channel_id = getattr(self, 'log_channel_id', None)
+                                    if log_channel_id:
+                                        log_channel = self.bot.get_channel(log_channel_id)
+                                        if log_channel:
+                                            await log_channel.send(f"📢 Banned blacklisted user {member.mention} ({member.id}) from {member.guild.name} for: {reason}")
+                                except discord.Forbidden:
+                                    print(f"No permission to ban {member.name} from {member.guild.name}")
+                                    
+                                    # Try to kick if ban fails
+                                    try:
+                                        await member.kick(reason=f"Blacklisted: {reason}")
+                                        print(f"Kicked blacklisted user {member.name} from {member.guild.name}")
+                                    except discord.Forbidden:
+                                        print(f"No permission to kick {member.name} from {member.guild.name}")
+                                    except Exception as e:
+                                        print(f"Error kicking {member.name}: {e}")
+                                except Exception as e:
+                                    print(f"Error banning {member.name}: {e}")
+                        except json.JSONDecodeError:
+                            print(f"Failed to parse API response: {response_text}")
                     else:
                         print(f"Failed to check blacklist for {member.id}: {response.status}")
         except Exception as e:
@@ -546,15 +590,32 @@ Reason: Griefing and using hacks"""
             kicked_servers = []
             if kick_from_servers:
                 for guild in self.bot.guilds:
-                    member = guild.get_member(user_id)
-                    if member:
-                        try:
-                            await member.kick(reason=f"Force blacklisted: {reason}")
-                            kicked_servers.append(guild.name)
-                        except discord.Forbidden:
-                            print(f"No permission to kick {username} from {guild.name}")
-                        except Exception as e:
-                            print(f"Error kicking {username} from {guild.name}: {e}")
+                    try:
+                        # First try to get from cache
+                        member = guild.get_member(user_id)
+                        
+                        if not member:
+                            # If not in cache, try to fetch the member
+                            try:
+                                member = await guild.fetch_member(user_id)
+                            except discord.NotFound:
+                                # User is not in this guild
+                                member = None
+                            except discord.HTTPException:
+                                # API error, skip this guild
+                                continue
+                        
+                        if member:
+                            try:
+                                await member.kick(reason=f"Force blacklisted: {reason}")
+                                kicked_servers.append(guild.name)
+                                print(f"Kicked {username} from {guild.name}")
+                            except discord.Forbidden:
+                                print(f"No permission to kick {username} from {guild.name}")
+                            except Exception as e:
+                                print(f"Error kicking {username} from {guild.name}: {e}")
+                    except Exception as e:
+                        print(f"Error processing guild {guild.name}: {e}")
             
             # Prepare response message
             response = f"User {username} ({user_id}) has been blacklisted for: {reason}"
