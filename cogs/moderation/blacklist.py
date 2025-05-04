@@ -13,6 +13,9 @@ load_dotenv()
 # File to store pending blacklist requests
 PENDING_FILE = "data/pending_blacklists.json"
 
+# File to store the announcement channel ID
+ANNOUNCEMENT_CHANNEL_FILE = "data/announcement_channel.json"
+
 class ConfirmButton(ui.View):
     def __init__(self, cog, blacklist_data, message_id=None):
         super().__init__(timeout=None)  # No timeout for persistent views
@@ -499,3 +502,6 @@ Reason: Griefing and using hacks"""
         await interaction.response.defer(ephemeral=True)
         self.save_announcement_channel(channel.id)
         await interaction.followup.send(f"Blacklist announcements will be sent to {channel.mention}", ephemeral=True)
+
+async def setup(bot):
+    await bot.add_cog(Blacklist(bot))
