@@ -38,7 +38,7 @@ async def on_ready():
     print(f'We have logged in as {bot.user}')
     
     await load_cogs()
- 
+    await bot.load_extension("cogs/accept_user.py") 
     print(f"Views have been registered for {len(bot.guilds)} guilds.")
 
     try:
