@@ -72,7 +72,7 @@ class ConfirmButton(ui.View):
                 except Exception as e:
                     print(f"Error checking membership in {guild.name}: {e}")
 
-            # Dm The owner
+            # DM the owner
             for guild in mutual_servers:
                 try:
                     member = guild.get_member(int(user_id))
@@ -86,12 +86,11 @@ class ConfirmButton(ui.View):
                             print(f"Error fetching member {username} in {guild.name}: {e}")
                             continue
 
-
                     if not member:
                         print(f"User {username} not found in {guild.name}, skipping")
                         continue
 
-                    print(f"Processing guild: {guild}")  # ADDED PRINT STATEMENT
+                    print(f"Processing guild: {guild}")
 
                     try:
                         owner_id = guild.owner_id
@@ -132,28 +131,11 @@ class ConfirmButton(ui.View):
 
                         if not response:
                             # Timeout after 24 hours
-                            await owner.send(f"No response recieved within 24 hours. `{username}` has not been kicked")
-
-                        if response and response.content.lower() == 'yes':
+                            await owner.send(f"No response received within 24 hours. `{username}` has not been kicked")
+                        elif response.content.lower() == 'yes':
                             await owner.send(f"User `{username}` has been kicked from `{guild.name}`.")
                             await member.kick(reason=f"Blacklisted: {reason}")
                             kicked_servers.append(guild.name)
-
-                            # Send announcement to the announcement channel
-                            announcement_channel_id = self.cog.get_announcement_channel()
-                            if announcement_channel_id:
-                                channel = self.cog.bot.get_channel(announcement_channel_id)
-                                if channel:
-                                    embed = discord.Embed(title="Blacklist Accepted", color=discord.Color.red())
-                                    embed.add_field(name="User", value=f"{username} ({user_id})", inline=False)
-                                    embed.add_field(name="Reason", value=reason, inline=False)
-                                    await channel.send(embed=embed)
-                                    print(f"Sent blacklist announcement to channel {channel.name}")
-                                else:
-                                    print(f"Error: Announcement channel with ID {announcement_channel_id} not found.")
-                            else:
-                                print("Error: Announcement channel not set.")
-
                         else:
                             await owner.send(f"User `{username}` will not be kicked from `{guild.name}`.")
 
@@ -186,6 +168,34 @@ class ConfirmButton(ui.View):
                             print(f"Failed to add to API blacklist: {response.status}")
             except Exception as e:
                 print(f"API blacklist error: {e}")
+
+            # Send announcement to the announcement channel
+            announcement_channel_id = self.cog.get_announcement_channel()
+            if announcement_channel_id:
+                print("before try fetch")
+                try:
+                    channel = await self.cog.bot.fetch_channel(announcement_channel_id)  # Use fetch_channel to avoid cache issues
+                    if channel:
+                        print("after try fetch")
+                        embed = discord.Embed(title="Blacklist Accepted", color=discord.Color.red())
+                        embed.add_field(name="User", value=f"{username} ({user_id})", inline=False)
+                        embed.add_field(name="Reason", value=reason, inline=False)
+                        if kicked_servers:
+                            embed.add_field(name="Kicked Servers", value="\n".join(kicked_servers), inline=False)
+                        else:
+                            embed.add_field(name="Kicked Servers", value="None", inline=False)
+                        await channel.send(embed=embed)
+                        print(f"Sent blacklist announcement to channel {channel.name} (ID: {announcement_channel_id})")
+                    else:
+                        print(f"Error: Announcement channel with ID {announcement_channel_id} not found.")
+                except discord.Forbidden:
+                    print(f"Error: Bot lacks permission to send messages in announcement channel (ID: {announcement_channel_id})")
+                except discord.NotFound:
+                    print(f"Error: Announcement channel with ID {announcement_channel_id} does not exist.")
+                except Exception as e:
+                    print(f"Error sending announcement to channel ID {announcement_channel_id}: {e}")
+            else:
+                print("Error: Announcement channel not set.")
 
             # Notify the blacklisted user
             if mutual_servers:
@@ -258,9 +268,13 @@ class Blacklist(commands.Cog):
             try:
                 with open(ANNOUNCEMENT_CHANNEL_FILE, 'r') as f:
                     data = json.load(f)
-                    return data.get('channel_id')
-            except (json.JSONDecodeError, FileNotFoundError):
+                    channel_id = data.get('channel_id')
+                    print(f"Loaded announcement channel ID: {channel_id}")
+                    return channel_id
+            except (json.JSONDecodeError, FileNotFoundError) as e:
+                print(f"Error loading announcement channel: {e}")
                 return None
+        print(f"Announcement channel file not found: {ANNOUNCEMENT_CHANNEL_FILE}")
         return None
 
     def save_announcement_channel(self, channel_id):
@@ -466,6 +480,28 @@ Reason: Griefing and using hacks"""
         except Exception as e:
             await interaction.followup.send(f"Failed to sync commands: {str(e)}", ephemeral=True)
 
+    @app_commands.command(name="test_announcment_channel", description="Test announcement")
+    async def test_channel(self, ctx):
+        """
+        A command to test if the announcement channel is set up correctly
+        and the bot can send messages to it.
+        """
+        channel_id = self.load_announcement_channel()
+        if channel_id:
+            channel = self.bot.get_channel(channel_id)
+            if channel:
+                try:
+                    await channel.send("Test message: Bot is working and can send messages to this channel!")
+                    await ctx.send(f"Test message sent to channel {channel.mention}!")
+                except discord.Forbidden:
+                    await ctx.send("I do not have permissions to send messages to the announcement channel.")
+                except Exception as e:
+                    await ctx.send(f"An error occurred: {e}")
+            else:
+                await ctx.send("Could not find the announcement channel. Please check the ID.")
+        else:
+            await ctx.send("Announcement channel is not set. Please set it using the set_channel command.")
+
     @app_commands.command(name="remove_from_blacklist", description="Remove a user from the blacklist by a specific field")
     @commands.check(lambda ctx: ctx.author.id in [987323487343493191, 1088268266499231764, 726721909374320640, 710863981039845467, 1151136371164065904])
     async def remove_from_blacklist(self, interaction: discord.Interaction, identifier: str, field: str = "user_id"):
@@ -500,8 +536,16 @@ Reason: Griefing and using hacks"""
     @app_commands.default_permissions(administrator=True)
     async def set_announcement_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         await interaction.response.defer(ephemeral=True)
-        self.save_announcement_channel(channel.id)
-        await interaction.followup.send(f"Blacklist announcements will be sent to {channel.mention}", ephemeral=True)
+        try:
+            # Test sending a message to verify permissions
+            test_message = await channel.send("Testing announcement channel permissions...")
+            await test_message.delete()  # Delete the test message
+            self.save_announcement_channel(channel.id)
+            await interaction.followup.send(f"Blacklist announcements will be sent to {channel.mention}", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send(f"Cannot set {channel.mention} as announcement channel: Bot lacks permission to send messages.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"Error setting announcement channel: {str(e)}", ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(Blacklist(bot))
