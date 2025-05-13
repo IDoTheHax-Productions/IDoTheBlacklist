@@ -6,7 +6,7 @@ class AcceptUserCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    accept = app_commands.Group(name="accept", description="Accept users into the private SMP")
+    accept = app_commands.Group(name="accept", description="Accept users into the Private SMP")
 
     @accept.command(name="user", description="Accept a user into the SMP")
     @commands.has_permissions(administrator=True)
@@ -17,7 +17,7 @@ class AcceptUserCog(commands.Cog):
         invite_link: str = None
     ):
         """
-        Accept a user into the SMP and send them a DM.
+        Accept a user into the SMP and send them a DM, or ping them in the channel if DMs are closed.
         :param interaction: The Discord interaction object
         :param username: The Discord username of the user (e.g., cooluser) or user ID
         :param invite_link: (Optional) A Discord invite link to include in the DM
@@ -39,9 +39,6 @@ class AcceptUserCog(commands.Cog):
             # If not found in cache, try fetching from Discord API (modern usernames)
             if not user:
                 try:
-                    # Note: Discord API doesn't directly support username search anymore,
-                    # so this is a fallback for users in the bot's cache or guild.
-                    # For guild-specific search:
                     guild = interaction.guild
                     if guild:
                         member = discord.utils.get(guild.members, name=username)
@@ -57,26 +54,34 @@ class AcceptUserCog(commands.Cog):
             )
             return
 
-        # Build the DM message
-        dm_message = (
-            f"Congratulations {user.name}, you have been accepted into the private SMP!\n"
+        # Build the message content
+        message_content = (
+            f"Congratulations {user.mention}, you have been accepted into the Private SMP!\n"
             "Please follow the instructions below to proceed.\n"
         )
         if invite_link:
-            dm_message += f"\nHere is your invite link: {invite_link}"
+            message_content += f"\nHere is your invite link: {invite_link}"
 
         # Try to send the DM
         try:
-            await user.send(dm_message)
+            await user.send(message_content)
             await interaction.response.send_message(
                 f"User '{user.name}' has been accepted and notified via DM.",
                 ephemeral=True
             )
         except discord.Forbidden:
-            await interaction.response.send_message(
-                f"Could not DM the user '{user.name}'. They may have DMs disabled or blocked the bot.",
-                ephemeral=True
-            )
+            # Fallback: Send the message in the channel, pinging the user
+            try:
+                await interaction.channel.send(message_content)
+                await interaction.response.send_message(
+                    f"Could not DM the user '{user.name}'. They have been pinged in the channel instead.",
+                    ephemeral=True
+                )
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    f"Could not DM or ping the user '{user.name}' in the channel. Please ensure the bot has permissions to send messages.",
+                    ephemeral=True
+                )
 
 async def setup(bot):
     await bot.add_cog(AcceptUserCog(bot))
