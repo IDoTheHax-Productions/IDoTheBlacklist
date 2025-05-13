@@ -163,4 +163,4 @@ cython_debug/
 .env
 /settings/*
 .git-credentials
-config.json
+*.json
