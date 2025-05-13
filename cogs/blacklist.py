@@ -177,14 +177,14 @@ class ConfirmButton(ui.View):
                     channel = await self.cog.bot.fetch_channel(announcement_channel_id)  # Use fetch_channel to avoid cache issues
                     if channel:
                         print("after try fetch")
-                        embed = discord.Embed(title="Blacklist Accepted", color=discord.Color.red())
-                        embed.add_field(name="User", value=f"{username} ({user_id})", inline=False)
-                        embed.add_field(name="Reason", value=reason, inline=False)
-                        if kicked_servers:
-                            embed.add_field(name="Kicked Servers", value="\n".join(kicked_servers), inline=False)
-                        else:
-                            embed.add_field(name="Kicked Servers", value="None", inline=False)
-                        await channel.send(embed=embed)
+                        
+                        # Create the embed using the new format
+                        post_link = f"https://discord.com/channels/{self.cog.bot.guild.id}/{announcement_channel_id}/{self.message_id}"
+                        embed = BlacklistEmbed.create_embed(user=username, reason=reason, banned_servers=kicked_servers, post_link=post_link)
+                        view = BlacklistEmbed.create_view(post_link)
+
+                        # Send the embed and view
+                        await channel.send(embed=embed, view=view)
                         print(f"Sent blacklist announcement to channel {channel.name} (ID: {announcement_channel_id})")
                     else:
                         print(f"Error: Announcement channel with ID {announcement_channel_id} not found.")
@@ -196,7 +196,7 @@ class ConfirmButton(ui.View):
                     print(f"Error sending announcement to channel ID {announcement_channel_id}: {e}")
             else:
                 print("Error: Announcement channel not set.")
-
+                
             # Notify the blacklisted user
             if mutual_servers:
                 user_dm_message = f"Hello {user.display_name},\n\nYou have been blacklisted for the following reason: {reason}\n\n"
@@ -249,6 +249,86 @@ class ConfirmButton(ui.View):
         self.cog.remove_pending_blacklist(self.message_id)  # Remove from pending on cancel
         self.stop()
 
+class BlacklistEmbed:
+    @staticmethod
+    def create_embed(user, reason, banned_servers, post_link):
+        """
+        Creates a Discord embed that matches the given design.
+
+        Args:
+            user (discord.User or str): The user being blacklisted. Can be a discord.User or a string (username).
+            reason (str): The reason for the blacklist.
+            banned_servers (list): List of banned servers.
+            post_link (str): Link to the original post/thread.
+
+        Returns:
+            discord.Embed: The embed object.
+        """
+        embed = discord.Embed(
+            title="Blacklist Accepted", 
+            color=discord.Color.red()
+        )
+
+        # Handle if `user` is a string or `discord.User`
+        if isinstance(user, discord.User):
+            username = user.display_name
+            user_id = user.id
+        else:
+            username = user  # Assume `user` is a string (username)
+            user_id = "Unknown ID"
+
+        # Add user and ID
+        embed.add_field(
+            name=f"{username}",
+            value=f"`{user_id}`",
+            inline=False
+        )
+
+        # Add Post link
+        embed.add_field(
+            name="Post:",
+            value=f"[{username}](<{post_link}>)",
+            inline=False
+        )
+
+        # Add Ban Reason
+        embed.add_field(
+            name="Ban Reason:",
+            value=reason,
+            inline=False
+        )
+
+        # Add Ban Check
+        banned_servers_str = "\n".join([f"✅ {server}" for server in banned_servers])
+        embed.add_field(
+            name="Ban Check:",
+            value=banned_servers_str,
+            inline=False
+        )
+
+        return embed
+
+    @staticmethod
+    def create_view(post_link):
+        """
+        Creates a View with a button linking to the post.
+
+        Args:
+            post_link (str): Link to the original post/thread.
+
+        Returns:
+            discord.ui.View: A view containing buttons.
+        """
+        button = Button(
+            label="Go To Post", 
+            url=post_link, 
+            style=discord.ButtonStyle.link
+        )
+
+        view = View()
+        view.add_item(button)
+
+        return view
 class Blacklist(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -546,6 +626,53 @@ Reason: Griefing and using hacks"""
             await interaction.followup.send(f"Cannot set {channel.mention} as announcement channel: Bot lacks permission to send messages.", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"Error setting announcement channel: {str(e)}", ephemeral=True)
+
+    @commands.command(name="test_blacklist_announcement")
+    async def test_blacklist_announcement(self, ctx, user_id: int):
+        """
+        Test the blacklist announcement functionality.
+
+        Parameters:
+        - user_id (int): The ID of the blacklisted user to test.
+        """
+        # Fetch blacklisted user data
+        try:
+            user = await self.bot.fetch_user(user_id)
+            if not user:
+                await ctx.send(f"User with ID {user_id} could not be found.")
+                return
+        except Exception as e:
+            await ctx.send(f"Error fetching user: {e}")
+            return
+
+        # Example data (replace with actual log retrieval)
+        reason = (
+            "Stealing Plugins and trading the stolen plugins for other plugins\n\n"
+            "He used to be known as Dex/D3xyt but he rebranded to a new name which is his old friend's name\n\n"
+            "Saying the n word"
+        )
+        kicked_servers = ["Immortal SMP", "Blitz SMP", "Marine SMP"]
+        post_link = f"https://discord.com/channels/{ctx.guild.id}/{ctx.channel.id}/123456789012345678"  # Replace with actual message ID
+
+        # Prepare and send the announcement
+        announcement_channel_id = self.get_announcement_channel()
+        if not announcement_channel_id:
+            await ctx.send("Announcement channel is not set. Please set it before testing.")
+            return
+
+        try:
+            channel = await self.bot.fetch_channel(announcement_channel_id)  # Fetch the announcement channel
+            if channel:
+                embed = BlacklistEmbed.create_embed(user=user, reason=reason, banned_servers=kicked_servers, post_link=post_link)
+                view = BlacklistEmbed.create_view(post_link)
+                await channel.send(embed=embed, view=view)
+                await ctx.send(f"Test announcement sent to {channel.mention}.")
+            else:
+                await ctx.send(f"Announcement channel with ID {announcement_channel_id} not found.")
+        except discord.Forbidden:
+            await ctx.send(f"Bot lacks permission to send messages in the announcement channel.")
+        except Exception as e:
+            await ctx.send(f"Error sending test announcement: {e}")
 
 async def setup(bot):
     await bot.add_cog(Blacklist(bot))
