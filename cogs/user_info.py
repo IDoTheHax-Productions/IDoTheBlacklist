@@ -41,9 +41,8 @@ class ManageSMPServersCog(commands.Cog):
         with open(self.config_file, "w") as f:
             json.dump(self.config, f, indent=4)
 
-    @tasks.loop(hours=24)
-    async def check_smp_members(self):
-        """Check SMP servers every 24 hours and update the smp_members list."""
+    async def sync_smp_members(self):
+        """Sync smp_members with current role assignments."""
         for server_id in self.config["smp_server_ids"]:
             server_id = str(server_id)
             guild = self.bot.get_guild(int(server_id))
@@ -70,12 +69,66 @@ class ManageSMPServersCog(commands.Cog):
 
         self.save_config()
 
+    @tasks.loop(hours=24)
+    async def check_smp_members(self):
+        """Check SMP servers every 24 hours and update the smp_members list."""
+        await self.sync_smp_members()
+
     @check_smp_members.before_loop
     async def before_check_smp_members(self):
         """Ensure the bot is ready before starting the task."""
         await self.bot.wait_until_ready()
 
-    smp = app_commands.Group(name="smp", description="Manage SMP server IDs and roles (server owners only)")
+    smp = app_commands.Group(name="smp", description="Manage SMP server IDs, roles, and user info")
+
+    @smp.command(name="check", description="Check which SMP servers you are in")
+    async def check_smp_servers(self, interaction: discord.Interaction):
+        """
+        Show the SMP servers the user is in, with a tick for membership.
+        """
+        user = interaction.user
+
+        # Get mutual servers
+        mutual_guilds = user.mutual_guilds
+        if not mutual_guilds:
+            await interaction.response.send_message(
+                "You are not in any servers with this bot.", ephemeral=True
+            )
+            return
+
+        # Build the response
+        response = "**Your SMP Servers**:\n"
+        smp_found = False
+
+        for guild in mutual_guilds:
+            # Check if the server is an SMP server
+            is_smp = guild.id in self.config["smp_server_ids"]
+            membership_mark = ""
+
+            if is_smp:
+                smp_found = True
+                # Check if the user is in the smp_members list for this server
+                if str(guild.id) in self.config["smp_members"] and user.id in self.config["smp_members"][str(guild.id)]:
+                    membership_mark = " ✅"
+
+            # Add server to the response if it's an SMP server
+            if is_smp:
+                response += f"- {guild.name}{membership_mark}\n"
+
+        if not smp_found:
+            response += "You are not in any SMP servers."
+
+        await interaction.response.send_message(response, ephemeral=True)
+
+    @smp.command(name="sync_roles", description="Manually sync SMP member roles")
+    @is_server_owner()
+    async def sync_smp_roles(self, interaction: discord.Interaction):
+        """
+        Manually sync the smp_members list with current role assignments.
+        """
+        await interaction.response.defer(ephemeral=True)
+        await self.sync_smp_members()
+        await interaction.followup.send("SMP member roles have been synced.", ephemeral=True)
 
     @smp.command(name="add", description="Add an SMP server ID")
     @is_server_owner()
