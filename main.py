@@ -19,13 +19,10 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 
 async def load_cogs():
-    for root, dirs, files in os.walk("./cogs"):  # Recursively walks through the cogs directory
+    for root, dirs, files in os.walk("./cogs"):
         for file in files:
             if file.endswith(".py") and file != "__init__.py":
-                # Create a module path, replacing the slashes with dots
-                cog_path = os.path.join(root, file).replace("./", "").replace("\\", ".").replace("/", ".")
-                cog_path = cog_path[:-3]  # Remove the .py extension
-                
+                cog_path = os.path.join(root, file).replace("./", "").replace("\\", ".").replace("/", ".")[:-3]
                 try:
                     await bot.load_extension(cog_path)
                     print(f"Loaded {cog_path}")
@@ -38,7 +35,7 @@ async def on_ready():
     print(f'We have logged in as {bot.user}')
     
     await load_cogs()
- 
+    #await bot.load_extension("cogs/accept_user.py") 
     print(f"Views have been registered for {len(bot.guilds)} guilds.")
 
     try:
