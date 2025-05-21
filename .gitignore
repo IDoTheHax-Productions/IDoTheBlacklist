@@ -165,3 +165,4 @@ cython_debug/
 .git-credentials
 config.json
 /data/*
+*.pem
