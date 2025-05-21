@@ -164,3 +164,4 @@ cython_debug/
 /settings/*
 .git-credentials
 config.json
+/data/*
