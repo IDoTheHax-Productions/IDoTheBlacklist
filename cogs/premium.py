@@ -19,33 +19,29 @@ PREMIUM_FILE = "settings/premium.json"
 ALLOWED_ADMIN_IDS = [726721909374320640, 1362041490779672576]
 STRIPE_API_KEY = os.getenv("STRIPE_API_KEY")  # Stripe sandbox API key
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")  # Stripe webhook secret
-STRIPE_PAYMENT_AMOUNT = 500  # €5 in cents (~$5 USD)
+STRIPE_PAYMENT_AMOUNT = 500  # 5 in cents (~$5 USD)
 
 def is_server_owner():
     async def predicate(interaction: discord.Interaction) -> bool:
         if not interaction.guild:
-            logger.error(f"Command {interaction.command.name} run outside guild by user {interaction.user.id}")
+            logger.error("is_server_owner: not in a guild")
             return False
         is_owner = interaction.user.id == interaction.guild.owner_id
         has_manage_guild = interaction.user.guild_permissions.manage_guild
-        result = is_owner or has_manage_guild
-        if not result:
-            logger.warning(
-                f"User {interaction.user.id} failed permission check in guild {interaction.guild.id}: "
-                f"Owner={is_owner}, Manage Guild={has_manage_guild}"
-            )
-        return result
+        logger.info(f"is_server_owner: is_owner={is_owner}, has_manage_guild={has_manage_guild}")
+        return is_owner or has_manage_guild
     return app_commands.check(predicate)
 
 def is_premium_server():
     async def predicate(interaction: discord.Interaction) -> bool:
         if not interaction.guild:
-            logger.error(f"Command {interaction.command.name} run outside guild by user {interaction.user.id}")
+            logger.error("is_premium_server: not in a guild")
             return False
         cog = interaction.client.get_cog("PremiumCog")
         if not cog:
-            logger.error("PremiumCog not found")
+            logger.error("is_premium_server: PremiumCog not found")
             return False
+        logger.info(f"is_premium_server: guild_id={interaction.guild.id}, paid={cog.premium_config['paid_servers']}, approved={cog.premium_config['approved_servers']}")
         return interaction.guild.id in (cog.premium_config["paid_servers"] + cog.premium_config["approved_servers"])
     return app_commands.check(predicate)
 
@@ -80,32 +76,107 @@ class PremiumCog(commands.Cog):
         await site.start()
         logger.info(f"Stripe webhook server running on port {self.webhook_port}")
 
-
     def load_premium_config(self):
-        os.makedirs(os.path.dirname(self.premium_file), exist_ok=True)
-        if not os.path.exists(self.premium_file):
-            with open(self.premium_file, "w") as f:
-                json.dump({
+        """Load premium configuration with better error handling."""
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(self.premium_file), exist_ok=True)
+            
+            # Check if file exists and create default if not
+            if not os.path.exists(self.premium_file):
+                logger.info(f"Premium config file doesn't exist, creating default at {self.premium_file}")
+                default_config = {
                     "paid_servers": [],
                     "approved_servers": [],
                     "applications": [],
                     "pending_payments": {}
-                }, f)
-        with open(self.premium_file, "r") as f:
-            self.premium_config = json.load(f)
+                }
+                with open(self.premium_file, "w", encoding='utf-8') as f:
+                    json.dump(default_config, f, indent=4)
+                self.premium_config = default_config
+                logger.info("Default premium config created successfully")
+                return
+            
+            # Load existing file
+            with open(self.premium_file, "r", encoding='utf-8') as f:
+                self.premium_config = json.load(f)
+            
+            # Validate config structure
+            required_keys = ["paid_servers", "approved_servers", "applications", "pending_payments"]
+            for key in required_keys:
+                if key not in self.premium_config:
+                    logger.warning(f"Missing key '{key}' in premium config, adding default")
+                    if key in ["paid_servers", "approved_servers", "applications"]:
+                        self.premium_config[key] = []
+                    else:  # pending_payments
+                        self.premium_config[key] = {}
+            
+            logger.info("Premium config loaded successfully")
+            
+        except PermissionError as e:
+            logger.error(f"Permission denied when accessing {self.premium_file}: {e}")
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in {self.premium_file}: {e}")
+            # Backup corrupted file and create new one
+            backup_file = f"{self.premium_file}.backup"
+            try:
+                os.rename(self.premium_file, backup_file)
+                logger.info(f"Backed up corrupted file to {backup_file}")
+            except Exception as backup_error:
+                logger.error(f"Failed to backup corrupted file: {backup_error}")
+            
+            # Create new default config
+            self.premium_config = {
+                "paid_servers": [],
+                "approved_servers": [],
+                "applications": [],
+                "pending_payments": {}
+            }
+            self.save_premium_config()
+        except Exception as e:
+            logger.error(f"Unexpected error loading premium config: {e}")
+            raise
 
     def save_premium_config(self):
-        with open(self.premium_file, "w") as f:
-            json.dump(self.premium_config, f, indent=4)
+        """Save premium configuration with error handling."""
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(self.premium_file), exist_ok=True)
+            
+            # Write to temporary file first
+            temp_file = f"{self.premium_file}.tmp"
+            with open(temp_file, "w", encoding='utf-8') as f:
+                json.dump(self.premium_config, f, indent=4, ensure_ascii=False)
+            
+            # Replace original file with temp file (atomic operation on most systems)
+            os.replace(temp_file, self.premium_file)
+            logger.info(f"Premium config saved successfully to {self.premium_file}")
+            
+        except PermissionError as e:
+            logger.error(f"Permission denied when saving to {self.premium_file}: {e}")
+            logger.error("Check file/directory permissions")
+        except OSError as e:
+            logger.error(f"OS error when saving premium config: {e}")
+            logger.error("Check disk space and file system permissions")
+        except Exception as e:
+            logger.error(f"Unexpected error saving premium config: {e}")
+            # Clean up temp file if it exists
+            temp_file = f"{self.premium_file}.tmp"
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
 
     async def create_stripe_checkout_session(self, user_id, server_id, guild_name, channel_id):
-        """Create a Stripe checkout session for €5."""
+        """Create a Stripe checkout session for 5."""
         try:
             session = self.stripe.checkout.Session.create(
                 payment_method_types=['card'],
                 line_items=[{
                     'price_data': {
-                        'currency': 'eur',
+                        'currency': 'gbp',
                         'product_data': {
                             'name': f'Premium Bot Features for {guild_name}',
                         },
@@ -114,8 +185,8 @@ class PremiumCog(commands.Cog):
                     'quantity': 1,
                 }],
                 mode='payment',
-                success_url=f'https://your-ngrok-url.ngrok-free.app/success?session_id={{CHECKOUT_SESSION_ID}}',
-                cancel_url=f'https://your-ngrok-url.ngrok-free.app/cancel?session_id={{CHECKOUT_SESSION_ID}}',
+                success_url=f'https://9bbc-2a02-6ea0-c041-2254-00-12.ngrok-free.app/success?session_id={{CHECKOUT_SESSION_ID}}',
+                cancel_url=f'https://9bbc-2a02-6ea0-c041-2254-00-12.ngrok-free.app/cancel?session_id={{CHECKOUT_SESSION_ID}}',
                 metadata={
                     'user_id': str(user_id),
                     'server_id': str(server_id),
@@ -123,14 +194,22 @@ class PremiumCog(commands.Cog):
                     'channel_id': str(channel_id),
                 }
             )
-            self.premium_config["pending_payments"][session.id] = {
-                "user_id": user_id,
-                "server_id": server_id,
-                "guild_name": guild_name,
-                "amount": STRIPE_PAYMENT_AMOUNT / 100,  # euro
-                "channel_id": channel_id
-            }
-            self.save_premium_config()
+            
+            # Save pending payment with error handling
+            try:
+                self.premium_config["pending_payments"][session.id] = {
+                    "user_id": user_id,
+                    "server_id": server_id,
+                    "guild_name": guild_name,
+                    "amount": STRIPE_PAYMENT_AMOUNT / 100,  # GBP (The Price Go up if it USD 🔥)
+                    "channel_id": channel_id
+                }
+                self.save_premium_config()
+                logger.info(f"Saved pending payment for session {session.id}")
+            except Exception as save_error:
+                logger.error(f"Failed to save pending payment: {save_error}")
+                # Still return the URL, but log the error
+            
             return session.url
         except Exception as e:
             logger.error(f"Failed to create Stripe checkout session: {e}")
@@ -162,25 +241,39 @@ class PremiumCog(commands.Cog):
 
     async def process_payment_success(self, session):
         """Process successful payment"""
-        metadata = session.get('metadata', {})
-        server_id = int(metadata.get('server_id'))
-        user_id = int(metadata.get('user_id'))
-        guild_name = metadata.get('guild_name', 'Unknown Server')
+        try:
+            metadata = session.get('metadata', {})
+            server_id = int(metadata.get('server_id'))
+            user_id = int(metadata.get('user_id'))
+            guild_name = metadata.get('guild_name', 'Unknown Server')
+            session_id = session['id']  # Stripe session object always has 'id'
 
-        if server_id not in self.premium_config["paid_servers"]:
-            self.premium_config["paid_servers"].append(server_id)
+            # Add to paid_servers if not already present
+            if server_id not in self.premium_config["paid_servers"]:
+                self.premium_config["paid_servers"].append(server_id)
+                logger.info(f"Added server {server_id} to paid_servers")
+
+            # Remove from pending_payments if present
+            if session_id in self.premium_config["pending_payments"]:
+                del self.premium_config["pending_payments"][session_id]
+                logger.info(f"Removed session {session_id} from pending_payments")
+
+            # Save changes
             self.save_premium_config()
 
-        # Notify user
-        user = await self.bot.fetch_user(user_id)
-        if user:
-            try:
-                await user.send(
-                    f"🎉 Payment confirmed! Premium features unlocked for {guild_name}!\n"
-                    "You can now use `/premium set_nickname` and `/premium set_pfp`."
-                )
-            except discord.Forbidden:
-                logger.warning(f"Could not DM user {user_id}")
+            # Notify user
+            user = await self.bot.fetch_user(user_id)
+            if user:
+                try:
+                    await user.send(
+                        f"🎉 Payment confirmed! Premium features unlocked for {guild_name}!\n"
+                        "You can now use `/premium set_nickname` and `/premium set_pfp`."
+                    )
+                    logger.info(f"Notified user {user_id} of successful payment")
+                except discord.Forbidden:
+                    logger.warning(f"Could not DM user {user_id}")
+        except Exception as e:
+            logger.error(f"Error processing payment success: {e}")
 
     premium = app_commands.Group(name="premium", description="Manage premium bot customization")
 
@@ -209,12 +302,13 @@ class PremiumCog(commands.Cog):
                 "Failed to set nickname. Ensure the bot has permission to change its nickname.", ephemeral=True
             )
 
-    @premium.command(name="set_pfp", description="Set the bot's profile picture in this server")
+    @premium.command(name="set_pfp", description="Set the bot's global profile picture")
     @is_server_owner()
     @is_premium_server()
     async def set_pfp(self, interaction: discord.Interaction, attachment: discord.Attachment):
         """
-        Set the bot's server-specific profile picture (premium only).
+        Set the bot's global profile picture (premium only).
+        Note: Discord doesn't support server-specific avatars, this changes the bot's global avatar.
         :param attachment: The image to set as the bot's avatar (PNG/JPEG)
         """
         await interaction.response.defer(ephemeral=True)
@@ -226,18 +320,24 @@ class PremiumCog(commands.Cog):
 
         try:
             image_bytes = await attachment.read()
-            await interaction.guild.me.edit(avatar=image_bytes)
+            # Change the bot's global avatar (not server-specific)
+            await self.bot.user.edit(avatar=image_bytes)
             await interaction.followup.send(
-                "Bot profile picture updated in this server.", ephemeral=True
+                "Bot profile picture updated globally. Note: This affects the bot across all servers.", ephemeral=True
             )
         except discord.Forbidden:
             await interaction.followup.send(
-                "Failed to set profile picture. Ensure the bot has permission to change its avatar.", ephemeral=True
+                "Failed to set profile picture. The bot may not have permission or you may be rate limited.", ephemeral=True
             )
-        except discord.HTTPException:
-            await interaction.followup.send(
-                "Failed to process the image. Ensure it's a valid PNG or JPEG.", ephemeral=True
-            )
+        except discord.HTTPException as e:
+            if e.status == 429:  # Rate limited
+                await interaction.followup.send(
+                    "Rate limited! You can only change the bot's avatar twice per hour. Please try again later.", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "Failed to process the image. Ensure it's a valid PNG or JPEG under 8MB.", ephemeral=True
+                )
 
     @premium.command(name="apply", description="Apply for free premium customization")
     @is_server_owner()
@@ -306,15 +406,22 @@ class PremiumCog(commands.Cog):
             )
             return
 
-        self.premium_config["applications"].append({
-            "server_id": server_id,
-            "user_id": interaction.user.id,
-            "description": description
-        })
-        self.save_premium_config()
-        await interaction.followup.send(
-            f"Application submitted for server {guild.name}. You will be notified once reviewed.", ephemeral=True
-        )
+        try:
+            self.premium_config["applications"].append({
+                "server_id": server_id,
+                "user_id": interaction.user.id,
+                "description": description
+            })
+            self.save_premium_config()
+            await interaction.followup.send(
+                f"Application submitted for server {guild.name}. You will be notified once reviewed.", ephemeral=True
+            )
+            logger.info(f"Application submitted for server {server_id} by user {interaction.user.id}")
+        except Exception as e:
+            logger.error(f"Failed to save application: {e}")
+            await interaction.followup.send(
+                "Failed to submit application. Please try again or contact an admin.", ephemeral=True
+            )
 
     @premium.command(name="review_application", description="Review a premium application")
     @is_admin_user()
@@ -349,31 +456,38 @@ class PremiumCog(commands.Cog):
         guild = self.bot.get_guild(server_id)
         guild_name = guild.name if guild else "Unknown Server"
 
-        self.premium_config["applications"].remove(application)
-        if action == "accept":
-            if server_id not in self.premium_config["approved_servers"]:
-                self.premium_config["approved_servers"].append(server_id)
-            message = f"Your application for premium customization in {guild_name} has been accepted!"
-        else:
-            message = f"Your application for premium customization in {guild_name} has been rejected."
-
-        self.save_premium_config()
-
         try:
-            owner = await self.bot.fetch_user(application["user_id"])
-            await owner.send(message)
-        except discord.Forbidden:
-            pass
+            self.premium_config["applications"].remove(application)
+            if action == "accept":
+                if server_id not in self.premium_config["approved_servers"]:
+                    self.premium_config["approved_servers"].append(server_id)
+                message = f"Your application for premium customization in {guild_name} has been accepted!"
+            else:
+                message = f"Your application for premium customization in {guild_name} has been rejected."
 
-        await interaction.followup.send(
-            f"Application for server {guild_name} has been {action}ed.", ephemeral=True
-        )
+            self.save_premium_config()
 
-    @premium.command(name="request_premium", description="Request premium features for a server")
+            try:
+                owner = await self.bot.fetch_user(application["user_id"])
+                await owner.send(message)
+            except discord.Forbidden:
+                pass
+
+            await interaction.followup.send(
+                f"Application for server {guild_name} has been {action}ed.", ephemeral=True
+            )
+            logger.info(f"Application for server {server_id} {action}ed by admin {interaction.user.id}")
+        except Exception as e:
+            logger.error(f"Failed to process application review: {e}")
+            await interaction.followup.send(
+                "Failed to process application review. Please try again.", ephemeral=True
+            )
+
+    @premium.command(name="get_premium", description="Get premium features for a server")
     @is_server_owner()
-    async def request_premium(self, interaction: discord.Interaction, server_id: str):
+    async def get_premium(self, interaction: discord.Interaction, server_id: str):
         """
-        Request premium features by generating a payment link for €5.
+        Get premium features by donating £5.
         :param server_id: The server ID to unlock premium for (numeric)
         """
         await interaction.response.defer(ephemeral=True)
@@ -432,13 +546,12 @@ class PremiumCog(commands.Cog):
             return
 
         await interaction.followup.send(
-            f"Please complete the €5 payment to unlock premium features for {guild.name}:\n{payment_url}\n"
+            f"Please complete the £5 payment to unlock premium features for {guild.name}:\n{payment_url}\n"
             "You will be notified once the payment is confirmed.",
             ephemeral=True
         )
 
     async def handle_success(self, request):
-        """Handle payment success redirect."""
         session_id = request.query.get('session_id')
         if not session_id:
             return web.Response(text="Missing session_id", status=400)
@@ -448,10 +561,15 @@ class PremiumCog(commands.Cog):
         user_id = pending["user_id"]
         channel_id = pending.get("channel_id")
         await self.notify_user(user_id, channel_id, True, pending["guild_name"])
+        # CLEANUP: Remove from pending_payments and save
+        try:
+            del self.premium_config["pending_payments"][session_id]
+            self.save_premium_config()
+        except Exception as e:
+            logger.error(f"Failed to cleanup pending payment: {e}")
         return web.Response(text="Payment successful! You will be notified in Discord.")
 
     async def handle_cancel(self, request):
-        """Handle payment cancel redirect."""
         session_id = request.query.get('session_id')
         if not session_id:
             return web.Response(text="Missing session_id", status=400)
@@ -461,6 +579,12 @@ class PremiumCog(commands.Cog):
         user_id = pending["user_id"]
         channel_id = pending.get("channel_id")
         await self.notify_user(user_id, channel_id, False, pending["guild_name"])
+        # CLEANUP: Remove from pending_payments and save
+        try:
+            del self.premium_config["pending_payments"][session_id]
+            self.save_premium_config()
+        except Exception as e:
+            logger.error(f"Failed to cleanup pending payment: {e}")
         return web.Response(text="Payment cancelled. You can try again from Discord.")
 
     async def notify_user(self, user_id, channel_id, success, guild_name):
@@ -486,8 +610,112 @@ class PremiumCog(commands.Cog):
                 except Exception:
                     pass
 
+    @premium.command(name="debug_payment", description="Debug a pending payment (Admin only)")
+    @is_admin_user()
+    async def debug_payment(self, interaction: discord.Interaction, session_id: str):
+        """
+        Manually process a pending payment for debugging.
+        :param session_id: The Stripe session ID from pending_payments
+        """
+        await interaction.response.defer(ephemeral=True)
+        
+        if session_id not in self.premium_config["pending_payments"]:
+            await interaction.followup.send(
+                f"Session ID `{session_id}` not found in pending payments.", ephemeral=True
+            )
+            return
+        
+        pending = self.premium_config["pending_payments"][session_id]
+        server_id = pending["server_id"]
+        user_id = pending["user_id"]
+        guild_name = pending["guild_name"]
+        
+        # Simulate successful payment processing
+        try:
+            # Add to paid_servers if not already present
+            if server_id not in self.premium_config["paid_servers"]:
+                self.premium_config["paid_servers"].append(server_id)
+                logger.info(f"DEBUG: Added server {server_id} to paid_servers")
+
+            # Remove from pending_payments
+            del self.premium_config["pending_payments"][session_id]
+            logger.info(f"DEBUG: Removed session {session_id} from pending_payments")
+
+            # Save changes
+            self.save_premium_config()
+            logger.info("DEBUG: Config saved successfully")
+
+            # Notify user
+            user = await self.bot.fetch_user(user_id)
+            if user:
+                try:
+                    await user.send(
+                        f"🎉 Payment manually processed! Premium features unlocked for {guild_name}!\n"
+                        "You can now use `/premium set_nickname` and `/premium set_pfp`."
+                    )
+                    logger.info(f"DEBUG: Notified user {user_id}")
+                except discord.Forbidden:
+                    logger.warning(f"DEBUG: Could not DM user {user_id}")
+
+            await interaction.followup.send(
+                f"✅ Successfully processed payment for {guild_name} (Server ID: {server_id})", 
+                ephemeral=True
+            )
+            
+        except Exception as e:
+            logger.error(f"DEBUG: Error processing payment: {e}")
+            await interaction.followup.send(
+                f"❌ Error processing payment: {str(e)}", ephemeral=True
+            )
+
+    @premium.command(name="check_webhook", description="Check webhook server status (Admin only)")
+    @is_admin_user()
+    async def check_webhook(self, interaction: discord.Interaction):
+        """Check if the webhook server is running and accessible."""
+        await interaction.response.defer(ephemeral=True)
+        
+        import aiohttp
+        webhook_url = "https://9bbc-2a02-6ea0-c041-2254-00-12.ngrok-free.app/stripe-webhook"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Try to access the webhook URL (this will fail but shows if it's reachable)
+                async with session.get(webhook_url.replace('/stripe-webhook', '/success')) as response:
+                    status = response.status
+                    await interaction.followup.send(
+                        f"✅ Webhook server is reachable. Status: {status}", ephemeral=True
+                    )
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Webhook server not reachable: {str(e)}\n"
+                f"URL: {webhook_url}", ephemeral=True
+            )
+
+    @premium.command(name="list_pending", description="List all pending payments (Admin only)")
+    @is_admin_user()
+    async def list_pending(self, interaction: discord.Interaction):
+        """List all pending payments for debugging."""
+        await interaction.response.defer(ephemeral=True)
+        
+        pending = self.premium_config["pending_payments"]
+        if not pending:
+            await interaction.followup.send("No pending payments.", ephemeral=True)
+            return
+        
+        message = "**Pending Payments:**\n"
+        for session_id, data in pending.items():
+            guild = self.bot.get_guild(data["server_id"])
+            guild_name = guild.name if guild else data["guild_name"]
+            message += f"• `{session_id[:20]}...` - {guild_name} (Server: {data['server_id']}) - User: <@{data['user_id']}>\n"
+        
+        await interaction.followup.send(message, ephemeral=True)
+
     def cog_unload(self):
-        asyncio.create_task(self.http_session.close())
+        # Note: http_session is not defined in your original code
+        # Remove this line or define http_session if needed
+        pass
 
 async def setup(bot):
-    await bot.add_cog(PremiumCog(bot))
+    premium_cog = PremiumCog(bot)
+    await bot.add_cog(premium_cog)
+    await premium_cog.start_webhook()
