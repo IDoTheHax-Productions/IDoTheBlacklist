@@ -7,12 +7,9 @@ import aiohttp
 import asyncio
 from dotenv import load_dotenv
 import logging
-import base64
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from datetime import datetime, timedelta
-import time
+import stripe
+from aiohttp import web
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -20,11 +17,9 @@ logger = logging.getLogger(__name__)
 
 PREMIUM_FILE = "settings/premium.json"
 ALLOWED_ADMIN_IDS = [726721909374320640, 1362041490779672576]
-BUNQ_API_KEY = os.getenv("BUNQ_API_KEY")  # Sandbox API key
-BUNQ_API_URL = "https://public-api.sandbox.bunq.com/v1"  # Sandbox API
-BUNQ_PAYMENT_AMOUNT = 5  # €5 (~$5 USD)
-PAYMENT_EMAIL = "hax@idothehax.com"
-WEBHOOK_URL = "https://8646-84-86-117-4.ngrok-free.app/bunq-webhook"
+STRIPE_API_KEY = os.getenv("STRIPE_API_KEY")  # Stripe sandbox API key
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")  # Stripe webhook secret
+STRIPE_PAYMENT_AMOUNT = 500  # €5 in cents (~$5 USD)
 
 def is_server_owner():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -67,191 +62,24 @@ class PremiumCog(commands.Cog):
         self.bot = bot
         self.premium_file = PREMIUM_FILE
         self.load_premium_config()
-        self.bunq_session = aiohttp.ClientSession()
-        self.user_id = None
-        self.monetary_account_id = None
-        self.session_token = None
-        self.session_expiry = None
-        self.private_key_pem = None
-        self.public_key_pem = None
-        self.installation_token = None
-        self.generate_key_pair()
+        self.webhook_server = None
+        self.webhook_port = 8000
+        self.stripe = stripe
+        stripe.api_key = STRIPE_API_KEY
+        self.success_statuses = {}  # session_id -> (user_id, channel_id, status)
 
-    def generate_key_pair(self):
-        """Generate or load RSA key pair for signing requests."""
-        private_key_file = 'private_key.pem'
-        public_key_file = 'public_key.pem'
-        
-        if os.path.exists(private_key_file) and os.path.exists(public_key_file):
-            with open(private_key_file, 'r') as private_file:
-                self.private_key_pem = private_file.read()
-            with open(public_key_file, 'r') as public_file:
-                self.public_key_pem = public_file.read()
-            logger.info("bunq - using existing keypair")
-        else:
-            private_key = rsa.generate_private_key(
-                public_exponent=65537,
-                key_size=2048
-            )
-            public_key = private_key.public_key()
-            self.private_key_pem = private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
-            ).decode('utf-8')
-            self.public_key_pem = public_key.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
-            ).decode('utf-8')
-            with open(private_key_file, 'w') as private_file:
-                private_file.write(self.private_key_pem)
-            with open(public_key_file, 'w') as public_file:
-                public_file.write(self.public_key_pem)
-            logger.info("bunq - creating new keypair [KEEP THESE FILES SAFE]")
+    async def start_webhook(self):
+        """Start a small HTTP server to handle Stripe webhooks and result routes."""
+        app = web.Application()
+        app.router.add_post('/stripe-webhook', self.handle_stripe_webhook)
+        app.router.add_get('/success', self.handle_success)
+        app.router.add_get('/cancel', self.handle_cancel)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', self.webhook_port)
+        await site.start()
+        logger.info(f"Stripe webhook server running on port {self.webhook_port}")
 
-    def sign_request(self, body: str) -> str:
-        """Sign request body with private key, following bunq's requirements."""
-        if not self.private_key_pem:
-            logger.error("Private key not initialized")
-            return ""
-        try:
-            # Ensure body is a valid JSON string
-            body_dict = json.loads(body) if body else {}
-            body_serialized = json.dumps(body_dict, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            encoded_data = body_serialized.encode('utf-8')
-            logger.debug(f"Serialized body for signing: {body_serialized}")
-            logger.debug(f"Body bytes (hex): {encoded_data.hex()}")
-            private_key = load_pem_private_key(self.private_key_pem.encode(), password=None)
-            signature = private_key.sign(
-                encoded_data,
-                padding.PKCS1v15(),
-                hashes.SHA256()
-            )
-            signature_b64 = base64.b64encode(signature).decode('utf-8')
-            logger.debug(f"Generated signature: {signature_b64}")
-            return signature_b64
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to serialize JSON for signing: {e}")
-            return ""
-        except Exception as e:
-            logger.error(f"Failed to sign request: {e}")
-            return ""
-
-    async def make_bunq_request(self, method: str, url: str, headers: dict, payload: dict = None, retries: int = 3, backoff: int = 5):
-        """Make a bunq API request with retry logic for 429 errors."""
-        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":")) if payload else ""
-        # Add this check:
-        if not payload_json:
-            logger.warning("Payload is empty, signature will be based on an empty string.")
-    
-        headers["X-Bunq-Client-Signature"] = self.sign_request(payload_json)
-        logger.info(f"{method} payload: {payload_json}")
-        logger.info(f"{method} signature: {headers['X-Bunq-Client-Signature']}")
-        
-        try:
-            async with self.bunq_session.request(method, url, headers=headers, data=payload_json) as response:
-                logger.info(f"Request to {url} returned status {response.status}")
-                if response.status == 429 and retries > 0:
-                    logger.warning(f"Rate limited. Retrying in {backoff} seconds...")
-                    await asyncio.sleep(backoff)
-                    return await self.make_bunq_request(method, url, headers, payload, retries - 1, backoff * 2)
-
-                if response.status != 200:
-                    error_message = await response.text()
-                    logger.error(f"Request to {url} failed: {response.status} - {error_message}")
-                    return None
-
-                try:
-                    data = await response.json()
-                    return data
-                except json.JSONDecodeError:
-                    logger.error(f"Failed to decode JSON response from {url}")
-                    return None
-
-        except aiohttp.ClientError as e:
-            logger.error(f"AIOHTTP error: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"An unexpected error occurred: {e}")
-            return None
-
-
-    async def initialize_bunq(self):
-        """Create API context: installation, device-server, session-server."""
-        if not BUNQ_API_KEY:
-            logger.error("BUNQ_API_KEY not set in .env")
-            return False
-
-        headers = {
-            "Content-Type": "application/json",
-            "Cache-Control": "none",
-            "User-Agent": "Sempy",
-            "X-Bunq-Client-Request-Id": str(os.urandom(16).hex()),
-            "X-Bunq-Language": "en_US",
-            "X-Bunq-Region": "en_US",
-            "X-Bunq-Geolocation": "0 0 0 0 000"
-        }
-
-        # Step 1: Installation
-        payload = {"client_public_key": self.public_key_pem}
-        data = await self.make_bunq_request("POST", f"{BUNQ_API_URL}/installation", headers, payload)
-        if not data:
-            return False
-        self.installation_token = data["Response"][1]["Token"]["token"]
-        logger.info("Installation successful")
-
-        # Step 2: Device Server
-        headers["X-Bunq-Client-Authentication"] = self.installation_token
-        payload = {
-            "description": "Sempy",
-            "secret": BUNQ_API_KEY,
-            "permitted_ips": ["*"]
-        }
-        data = await self.make_bunq_request("POST", f"{BUNQ_API_URL}/device-server", headers, payload)
-        if not data:
-            return False
-        logger.info("Device server registered")
-
-        # Step 3: Session Server
-        headers["X-Bunq-Client-Authentication"] = self.installation_token
-        payload = {"secret": BUNQ_API_KEY}
-        data = await self.make_bunq_request("POST", f"{BUNQ_API_URL}/session-server", headers, payload)
-        if not data:
-            return False
-        self.session_token = data["Response"][1]["Token"]["token"]
-        self.user_id = data["Response"][2]["UserPerson"]["id"]
-        self.session_expiry = datetime.utcnow() + timedelta(minutes=55)
-        logger.info(f"Session created: user_id={self.user_id}")
-
-        # Step 4: Fetch monetary account
-        headers["X-Bunq-Client-Authentication"] = self.session_token
-        try:
-            async with self.bunq_session.get(
-                f"{BUNQ_API_URL}/user/{self.user_id}/monetary-account",
-                headers=headers
-            ) as response:
-                if response.status != 200:
-                    logger.error(f"Failed to fetch monetary account: {response.status} {await response.text()}")
-                    return False
-                data = await response.json()
-                accounts = [acc for acc in data["Response"] if acc["MonetaryAccountBank"]["status"] == "ACTIVE"]
-                if not accounts:
-                    logger.error("No active monetary account found")
-                    return False
-                self.monetary_account_id = accounts[0]["MonetaryAccountBank"]["id"]
-                logger.info(f"Monetary account fetched: monetary_account_id={self.monetary_account_id}")
-        except Exception as e:
-            logger.error(f"Error fetching monetary account: {e}")
-            return False
-
-        return True
-
-    async def refresh_session_if_needed(self):
-        """Refresh session token if expired or near expiry."""
-        if self.session_token and self.session_expiry and datetime.utcnow() < self.session_expiry:
-            return True
-        logger.info("Refreshing bunq session")
-        return await self.initialize_bunq()
 
     def load_premium_config(self):
         os.makedirs(os.path.dirname(self.premium_file), exist_ok=True)
@@ -270,91 +98,89 @@ class PremiumCog(commands.Cog):
         with open(self.premium_file, "w") as f:
             json.dump(self.premium_config, f, indent=4)
 
-    async def create_bunq_payment_request(self, user_id, server_id, guild_name):
-        """Create a bunq.me payment request for €5."""
-        if not await self.refresh_session_if_needed():
-            logger.error("Failed to refresh bunq session.")
-            return None
-
-        headers = {
-            "Content-Type": "application/json",
-            "X-Bunq-Client-Authentication": self.session_token,
-            "X-Bunq-Client-Request-Id": str(os.urandom(16).hex()),
-            "X-Bunq-Language": "en_US",
-            "X-Bunq-Region": "en_US",
-            "X-Bunq-Geolocation": "0 0 0 0 000"
-        }
-        payload = {
-            "amount_inquired": {
-                "value": str(BUNQ_PAYMENT_AMOUNT),
-                "currency": "EUR"
-            },
-            "description": f"Premium customization for {guild_name} (Server ID: {server_id})",
-            "counterparty_alias": {
-                "type": "EMAIL",
-                "value": PAYMENT_EMAIL
-            },
-            "allow_bunqme": True  # Assuming you want to allow bunq.me
-        }
-
+    async def create_stripe_checkout_session(self, user_id, server_id, guild_name, channel_id):
+        """Create a Stripe checkout session for €5."""
         try:
-            data = await self.make_bunq_request(
-                "POST",
-                f"{BUNQ_API_URL}/user/{self.user_id}/monetary-account/{self.monetary_account_id}/request-inquiry",
-                headers,
-                payload
+            session = self.stripe.checkout.Session.create(
+                payment_method_types=['card'],
+                line_items=[{
+                    'price_data': {
+                        'currency': 'eur',
+                        'product_data': {
+                            'name': f'Premium Bot Features for {guild_name}',
+                        },
+                        'unit_amount': STRIPE_PAYMENT_AMOUNT,
+                    },
+                    'quantity': 1,
+                }],
+                mode='payment',
+                success_url=f'https://your-ngrok-url.ngrok-free.app/success?session_id={{CHECKOUT_SESSION_ID}}',
+                cancel_url=f'https://your-ngrok-url.ngrok-free.app/cancel?session_id={{CHECKOUT_SESSION_ID}}',
+                metadata={
+                    'user_id': str(user_id),
+                    'server_id': str(server_id),
+                    'guild_name': guild_name,
+                    'channel_id': str(channel_id),
+                }
             )
-
-            if not data:
-                logger.error("Failed to create bunq payment request: No data received.")
-                return None
-
-            if "Error" in data:
-                logger.error(f"Failed to create bunq payment request: API Error - {data['Error']}")
-                return None
-
-            request_id = data["Response"][0]["Id"]["id"]
-            payment_link = f"https://bunq.me/sempy/{BUNQ_PAYMENT_AMOUNT}?description=Premium+for+{server_id}&request_id={request_id}"
-            logger.info(f"Generated payment link: {payment_link}")  # Log the generated link
-            return payment_link
-
+            self.premium_config["pending_payments"][session.id] = {
+                "user_id": user_id,
+                "server_id": server_id,
+                "guild_name": guild_name,
+                "amount": STRIPE_PAYMENT_AMOUNT / 100,  # euro
+                "channel_id": channel_id
+            }
+            self.save_premium_config()
+            return session.url
         except Exception as e:
-            logger.error(f"An unexpected error occurred while creating payment request: {e}")
+            logger.error(f"Failed to create Stripe checkout session: {e}")
             return None
 
-    async def setup_bunq_webhook(self):
-        """Set up a bunq webhook for payment notifications."""
-        if not await self.refresh_session_if_needed():
-            logger.error("Failed to refresh session before setting up webhook.")
-            return False
+    async def handle_stripe_webhook(self, request):
+        """Handle incoming Stripe webhook"""
+        payload = await request.text()
+        sig_header = request.headers.get('Stripe-Signature')
 
-        headers = {
-            "Content-Type": "application/json",
-            "X-Bunq-Client-Authentication": self.session_token,
-            "X-Bunq-Client-Request-Id": str(os.urandom(16).hex()),
-            "X-Bunq-Language": "en_US",
-            "X-Bunq-Region": "en_US",
-            "X-Bunq-Geolocation": "0 0 0 0 000"
-        }
-        payload = {
-            "url": WEBHOOK_URL,
-            "category": "MUTATION"
-        }
         try:
-            data = await self.make_bunq_request("POST", f"{BUNQ_API_URL}/user/{self.user_id}/notification-filter-url", headers, payload)
-            if not data:
-                logger.error("Failed to setup bunq webhook: No data received.")
-                return False
+            event = stripe.Webhook.construct_event(
+                payload,
+                sig_header,
+                STRIPE_WEBHOOK_SECRET
+            )
+        except ValueError as e:
+            logger.error(f"Invalid payload: {e}")
+            return web.Response(status=400)
+        except stripe.error.SignatureVerificationError as e:
+            logger.error(f"Invalid signature: {e}")
+            return web.Response(status=400)
 
-            if "Error" in data:
-                logger.error(f"Failed to setup bunq webhook: API Error - {data['Error']}")
-                return False
+        if event['type'] == 'checkout.session.completed':
+            session = event['data']['object']
+            await self.process_payment_success(session)
 
-            logger.info("bunq webhook setup successful")
-            return True
-        except Exception as e:
-            logger.error(f"An error occurred during webhook setup: {e}")
-            return False
+        return web.Response(status=200)
+
+    async def process_payment_success(self, session):
+        """Process successful payment"""
+        metadata = session.get('metadata', {})
+        server_id = int(metadata.get('server_id'))
+        user_id = int(metadata.get('user_id'))
+        guild_name = metadata.get('guild_name', 'Unknown Server')
+
+        if server_id not in self.premium_config["paid_servers"]:
+            self.premium_config["paid_servers"].append(server_id)
+            self.save_premium_config()
+
+        # Notify user
+        user = await self.bot.fetch_user(user_id)
+        if user:
+            try:
+                await user.send(
+                    f"🎉 Payment confirmed! Premium features unlocked for {guild_name}!\n"
+                    "You can now use `/premium set_nickname` and `/premium set_pfp`."
+                )
+            except discord.Forbidden:
+                logger.warning(f"Could not DM user {user_id}")
 
     premium = app_commands.Group(name="premium", description="Manage premium bot customization")
 
@@ -482,7 +308,7 @@ class PremiumCog(commands.Cog):
 
         self.premium_config["applications"].append({
             "server_id": server_id,
-            "owner_name": interaction.user.name,  # Store username instead of ID
+            "user_id": interaction.user.id,
             "description": description
         })
         self.save_premium_config()
@@ -522,12 +348,6 @@ class PremiumCog(commands.Cog):
 
         guild = self.bot.get_guild(server_id)
         guild_name = guild.name if guild else "Unknown Server"
-        if application:
-            owner_name = application["owner_name"]  # Get username from application data
-            # ... display the owner_name in the review message
-            await interaction.followup.send(
-                f"Application for server {guild_name} by {owner_name} has been {action}ed.", ephemeral=True
-            )
 
         self.premium_config["applications"].remove(application)
         if action == "accept":
@@ -539,16 +359,15 @@ class PremiumCog(commands.Cog):
 
         self.save_premium_config()
 
-        # Fetching user is not required to send a message
-        # owner = await self.bot.fetch_user(owner_id) if owner_id else None
-        # Instead of fetching the user, directly send the message
-        # if owner:
         try:
-            # Use user_id stored in application data
-            owner = await self.bot.fetch_user(application["owner_id"])
+            owner = await self.bot.fetch_user(application["user_id"])
             await owner.send(message)
         except discord.Forbidden:
             pass
+
+        await interaction.followup.send(
+            f"Application for server {guild_name} has been {action}ed.", ephemeral=True
+        )
 
     @premium.command(name="request_premium", description="Request premium features for a server")
     @is_server_owner()
@@ -603,60 +422,72 @@ class PremiumCog(commands.Cog):
             )
             return
 
-        payment_link = await self.create_bunq_payment_request(interaction.user.id, server_id, guild.name)
-        if not payment_link:
+        payment_url = await self.create_stripe_checkout_session(
+            interaction.user.id, server_id, guild.name, interaction.channel_id
+        )
+        if not payment_url:
             await interaction.followup.send(
                 "Failed to generate payment link. Contact the bot admin.", ephemeral=True
             )
             return
 
-        self.premium_config["pending_payments"][str(server_id)] = {
-            "user_id": interaction.user.id,
-            "amount": BUNQ_PAYMENT_AMOUNT,
-            "guild_name": guild.name
-        }
-        self.save_premium_config()
-
         await interaction.followup.send(
-            f"Please complete the €5 payment to unlock premium features for {guild.name}:\n{payment_link}\n"
-            "You will be notified once the payment is confirmed. (This is a Sandbox link, no real payment needed.)",
+            f"Please complete the €5 payment to unlock premium features for {guild.name}:\n{payment_url}\n"
+            "You will be notified once the payment is confirmed.",
             ephemeral=True
         )
 
-    async def handle_bunq_webhook(self, payment_data):
-        """Handle incoming bunq webhook for payment confirmation."""
-        logger.info(f"Received webhook data: {payment_data}")  # Log the entire webhook data
+    async def handle_success(self, request):
+        """Handle payment success redirect."""
+        session_id = request.query.get('session_id')
+        if not session_id:
+            return web.Response(text="Missing session_id", status=400)
+        pending = self.premium_config["pending_payments"].get(session_id)
+        if not pending:
+            return web.Response(text="Session not found or already processed.", status=404)
+        user_id = pending["user_id"]
+        channel_id = pending.get("channel_id")
+        await self.notify_user(user_id, channel_id, True, pending["guild_name"])
+        return web.Response(text="Payment successful! You will be notified in Discord.")
 
-        server_id = None
-        for pending in self.premium_config["pending_payments"].values():
-            if pending["amount"] == float(payment_data.get("amount", {}).get("value", 0)):
-                server_id = next(
-                    sid for sid, data in self.premium_config["pending_payments"].items()
-                    if data == pending
-                )
-                break
+    async def handle_cancel(self, request):
+        """Handle payment cancel redirect."""
+        session_id = request.query.get('session_id')
+        if not session_id:
+            return web.Response(text="Missing session_id", status=400)
+        pending = self.premium_config["pending_payments"].get(session_id)
+        if not pending:
+            return web.Response(text="Session not found or already processed.", status=404)
+        user_id = pending["user_id"]
+        channel_id = pending.get("channel_id")
+        await self.notify_user(user_id, channel_id, False, pending["guild_name"])
+        return web.Response(text="Payment cancelled. You can try again from Discord.")
 
-        if not server_id:
-            logger.warning("No matching payment found in webhook")
+    async def notify_user(self, user_id, channel_id, success, guild_name):
+        """DM or ping user with payment status."""
+        user = await self.bot.fetch_user(user_id)
+        message = (
+            f"✅ Payment successful! Premium features unlocked for {guild_name}."
+            if success else
+            f"❌ Payment was cancelled for {guild_name}."
+        )
+        # Try DM
+        try:
+            await user.send(message)
             return
-
-        server_id = int(server_id)
-        payment_info = self.premium_config["pending_payments"].pop(str(server_id))
-        self.premium_config["paid_servers"].append(server_id)
-        self.save_premium_config()
-
-        owner = await self.bot.fetch_user(payment_info["user_id"])
-        if owner:
-            try:
-                await owner.send(
-                    f"Payment confirmed! Premium features unlocked for {payment_info['guild_name']}."
-                    " You can now use /premium set_nickname and /premium set_pfp."
-                )
-            except discord.Forbidden:
-                pass
+        except Exception:
+            pass  # DMs closed or otherwise failed
+        # Try ping in channel if available
+        if channel_id:
+            channel = self.bot.get_channel(int(channel_id))
+            if channel:
+                try:
+                    await channel.send(f"<@{user_id}> {message}")
+                except Exception:
+                    pass
 
     def cog_unload(self):
-        asyncio.create_task(self.bunq_session.close())
+        asyncio.create_task(self.http_session.close())
 
 async def setup(bot):
     await bot.add_cog(PremiumCog(bot))
