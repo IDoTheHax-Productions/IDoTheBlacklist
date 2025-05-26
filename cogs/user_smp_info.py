@@ -274,7 +274,10 @@ class ManageSMPServersCog(commands.Cog):
         for server_id in self.config.get("smp_server_ids", []):
             server_id = str(server_id)
             if server_id in self.config.get("user_logs", {}) and user_id in self.config["user_logs"][server_id]:
-                logs.extend(self.config["user_logs"][server_id][user_id])
+                guild = self.bot.get_guild(int(server_id))
+                server_name = guild.name if guild else f"Server ID: {server_id}"
+                for log in self.config["user_logs"][server_id][user_id]:
+                    logs.append(f"{server_name}: {log}")
         return logs
 
     def get_approved_smps(self):
@@ -348,26 +351,48 @@ class ManageSMPServersCog(commands.Cog):
         user_logs = await self.get_user_logs(user)
 
         # Use custom emojis
+        custom_enter = "<:enter:1376541503106580560>"
+        custom_search = "<:search:1376541451986538649>"
         custom_checkmark = "<:yes:1376542481142911017>"
         custom_right = "<:join:1376544657860857917>"
         custom_left = "<:leave:1376544545914753075>" 
-        custom_hammer = "<:ban_hammer:1376542636126765107>" 
+        custom_hammer = "<:ban_hammer:1376542636126765107>"
 
-        # Format SMP servers with custom bullet
-        smp_list = [f"• {smp}" for smp in smp_servers] if smp_servers else [f"{custom_bullet} Not in any SMP servers."]
-        embed1 = discord.Embed(title=f"{custom_checkmark} SMP Info for {user.name}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀", color=discord.Color.dark_embed())
-        embed1.set_footer(text=f"Page 1 | 2")
+        # Format SMP servers with code block
+        smp_list = [f"• {smp}\n" for smp in smp_servers] if smp_servers else [f"{custom_checkmark} not in any smp servers"]
+        embed1 = discord.Embed(
+            title=f"{custom_search} **SMP info for {user.name}**⠀⠀⠀",
+            description="⠀⠀",  # Vertical padding
+            color=discord.Color.dark_embed()
+        )
+        embed1.set_footer(text="page 1 | 2")
         embed1.add_field(
-            name="SMP Servers",
-            value="\n\n".join(smp_list),
+            name="\n```" + "SMP servers:" + f"```{custom_enter}\n",
+            value=f"```" + "\n".join(smp_list) + "```",
+            inline=False
+        )
+        embed1.add_field(
+            name="⠀",  # Invisible field for extra spacing
+            value="",
             inline=False
         )
 
-        embed2 = discord.Embed(title=f"{custom_hammer} Moderation Log for {user.name}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀", color=discord.Color.red())
-        embed2.set_footer(text=f"Page 2 | 2")
+        # Format moderation logs with code block
+        log_list = [f"{log}" for log in user_logs] if user_logs else [f"no moderation logs found"]
+        embed2 = discord.Embed(
+            title=f"{custom_hammer} **Mod log for {user.name}**⠀⠀⠀",
+            description="⠀⠀",  # Vertical padding
+            color=discord.Color.red()
+        )
+        embed2.set_footer(text="page 2 | 2")
         embed2.add_field(
-            name="\nLogs",
-            value="\n\n".join(user_logs) if user_logs else "No moderation logs found.",
+            name="\nlogs\n",
+            value=f"```" + "\n".join(log_list) + "```",
+            inline=False
+        )
+        embed2.add_field(
+            name="⠀",  # Invisible field for extra spacing
+            value="",
             inline=False
         )
 
@@ -407,7 +432,8 @@ class ManageSMPServersCog(commands.Cog):
         left_button.callback = left_button_callback
         right_button.callback = right_button_callback
 
-        await interaction.followup.send(embed=embed1, view=view)
+        # Send the text and embed in the same message
+        await interaction.followup.send(content=f"{custom_search} <@{user.id}>", embed=embed1, view=view)
 
     @smp.command(name="roster", description="List the whole roster for an SMP")
     async def roster(self, interaction: discord.Interaction, smp_name: str):
@@ -501,22 +527,62 @@ class ManageSMPServersCog(commands.Cog):
     async def apply(self, interaction: discord.Interaction, smp_name: str):
         server_id = str(interaction.guild.id)
         if server_id not in self.config.get("smp_configs", {}):
-            await interaction.response.send_message("<:no:1376542605885706351> This SMP is not set up yet. Use `/smp setup` first!", ephemeral=False)
+            embed = discord.Embed(
+                title=f"<:no:1376542605885706351> error⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+                description="⠀⠀",  # Vertical padding
+                color=discord.Color.red()
+            )
+            embed.add_field(
+                name="\nmessage\n",
+                value="this smp is not set up yet. use `/setup` first!\n",
+                inline=False
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=False)
             return
 
         smp_config = self.config["smp_configs"][server_id]
-        
+
         if smp_config.get("approved", False):
-            await interaction.response.send_message("<:yes:1376542481142911017> This SMP is already approved and listed!", ephemeral=False)
+            embed = discord.Embed(
+                title=f"<:yes:1376542481142911017> success⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+                description="⠀⠀",  # Vertical padding
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name="\nmessage\n",
+                value="this smp is already approved and listed!\n",
+                inline=False
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=False)
             return
 
         if smp_config["name"].lower() != smp_name.lower():
-            await interaction.response.send_message(f"<:no:1376542605885706351> SMP name doesn't match. Configured name: **{smp_config['name']}**", ephemeral=False)
+            embed = discord.Embed(
+                title=f"<:no:1376542605885706351> error⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+                description="⠀⠀",  # Vertical padding
+                color=discord.Color.red()
+            )
+            embed.add_field(
+                name="\nmessage\n",
+                value=f"smp name doesn't match. configured name: **{smp_config['name']}**\n",
+                inline=False
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=False)
             return
 
         smp_core_channel = self.bot.get_channel(SMP_CORE_CHANNEL_ID)
         if not smp_core_channel:
-            await interaction.response.send_message("<:no:1376542605885706351> SMP Core channel not configured. Please contact the developers.", ephemeral=True)
+            embed = discord.Embed(
+                title=f"<:no:1376542605885706351> error⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+                description="⠀⠀",  # Vertical padding
+                color=discord.Color.red()
+            )
+            embed.add_field(
+                name="\nmessage\n",
+                value="smp core channel not configured. please contact the developers.\n",
+                inline=False
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
         embed = discord.Embed(
