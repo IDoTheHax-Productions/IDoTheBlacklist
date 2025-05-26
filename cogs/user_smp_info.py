@@ -6,6 +6,10 @@ import os
 from datetime import datetime
 import asyncio
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
+AUTHORIZED_USER_IDS = [int(id) for id in os.getenv("AUTHORIZED_USER_IDS").split(",")]
 
 # Configure logging for debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,7 +48,7 @@ class SetupModal(discord.ui.Modal, title='SMP Setup'):
         # Validate role ID
         if not role_id.isdigit():
             await interaction.response.send_message(
-                "❌ Invalid role ID format. Please enter a valid numeric role ID.", 
+                "<:no:1376542605885706351> Invalid role ID format. Please enter a valid numeric role ID.", 
                 ephemeral=True
             )
             return
@@ -52,7 +56,7 @@ class SetupModal(discord.ui.Modal, title='SMP Setup'):
         role = interaction.guild.get_role(int(role_id))
         if not role:
             await interaction.response.send_message(
-                f"❌ Role with ID {role_id} not found in this server.", 
+                f"<:no:1376542605885706351> Role with ID {role_id} not found in this server.", 
                 ephemeral=True
             )
             return
@@ -60,7 +64,7 @@ class SetupModal(discord.ui.Modal, title='SMP Setup'):
         # Validate invite link
         if not (invite_link.startswith('https://discord.gg/') or invite_link.startswith('https://discord.com/invite/')):
             await interaction.response.send_message(
-                "❌ Invalid invite link format. Please use a valid Discord invite link.", 
+                "<:no:1376542605885706351> Invalid invite link format. Please use a valid Discord invite link.", 
                 ephemeral=True
             )
             return
@@ -84,18 +88,20 @@ class SetupModal(discord.ui.Modal, title='SMP Setup'):
         self.cog.save_config()
         logger.info(f"SMP setup completed for server {server_id} with name {self.smp_name}")
 
+        # Use custom emoji for success embed
+        custom_checkmark = "<:custom_checkmark:123456789012345678>"  # Replace with actual ID
         embed = discord.Embed(
-            title="✅ SMP Setup Complete!",
+            title=f"{custom_checkmark} SMP Setup Complete!",
             description=f"**SMP Name:** {self.smp_name}\n**Member Role:** {role.mention} ({role.name})\n**Invite Link:** {invite_link}",
             color=discord.Color.green()
         )
         embed.add_field(
             name="Next Steps",
-            value="Your SMP is now configured! Users can apply using `/apply` command.",
+            value=f"Your SMP is now configured! Users can apply using `/apply` command.",
             inline=False
         )
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=False)
 
 class ApplicationView(discord.ui.View):
     def __init__(self, cog, application_data):
@@ -103,10 +109,10 @@ class ApplicationView(discord.ui.View):
         self.cog = cog
         self.application_data = application_data
 
-    @discord.ui.button(label='Accept', style=discord.ButtonStyle.success, emoji='✅')
+    @discord.ui.button(label='Accept', style=discord.ButtonStyle.success, emoji='<:yes:1376542481142911017>')
     async def accept_application(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ You need administrator permissions to approve applications.", ephemeral=True)
+            await interaction.response.send_message("<:no:1376542605885706351> You need administrator permissions to approve applications.", ephemeral=True)
             return
 
         server_id = str(self.application_data["server_id"])
@@ -127,7 +133,7 @@ class ApplicationView(discord.ui.View):
 
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.green()
-        embed.add_field(name="Status", value=f"✅ **APPROVED** by {interaction.user.mention}", inline=False)
+        embed.add_field(name="Status", value=f"<:yes:1376542481142911017> **APPROVED** by {interaction.user.mention}", inline=False)
         
         for item in self.children:
             item.disabled = True
@@ -146,15 +152,15 @@ class ApplicationView(discord.ui.View):
         except Exception as e:
             logger.error(f"Failed to notify applicant {self.application_data['applicant_id']}: {e}")
 
-    @discord.ui.button(label='Deny', style=discord.ButtonStyle.danger, emoji='❌')
+    @discord.ui.button(label='Deny', style=discord.ButtonStyle.danger, emoji='<:no:1376542605885706351>')
     async def deny_application(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ You need administrator permissions to deny applications.", ephemeral=True)
+            await interaction.response.send_message("<:no:1376542605885706351> You need administrator permissions to deny applications.", ephemeral=True)
             return
 
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.red()
-        embed.add_field(name="Status", value=f"❌ **DENIED** by {interaction.user.mention}", inline=False)
+        embed.add_field(name="Status", value=f"<:no:1376542605885706351> **DENIED** by {interaction.user.mention}", inline=False)
         
         for item in self.children:
             item.disabled = True
@@ -165,7 +171,7 @@ class ApplicationView(discord.ui.View):
             applicant = self.cog.bot.get_user(self.application_data["applicant_id"])
             if applicant:
                 notify_embed = discord.Embed(
-                    title="❌ SMP Application Denied",
+                    title="<:no:1376542605885706351> SMP Application Denied",
                     description=f"Your SMP **{self.application_data['smp_name']}** application has been denied.",
                     color=discord.Color.red()
                 )
@@ -334,32 +340,40 @@ class ManageSMPServersCog(commands.Cog):
 
     smp = app_commands.Group(name="smp", description="Manage SMP server IDs, roles, and user info")
 
-    @smp.command(name="info", description="Show SMP and moderation info for a user")
+    @app_commands.command(name="info", description="Show SMP and moderation info for a user")
     async def info(self, interaction: discord.Interaction, user: discord.User):
         await interaction.response.defer()
 
         smp_servers = await self.get_smp_servers_for_user(user)
         user_logs = await self.get_user_logs(user)
 
-        embed1 = discord.Embed(title=f"SMP Info for {user.name}", color=discord.Color.blue())
-        embed1.set_footer(text="Page 1/2")
+        # Use custom emojis
+        custom_checkmark = "<:yes:1376542481142911017>"
+        custom_right = "<:join:1376544657860857917>"
+        custom_left = "<:leave:1376544545914753075>" 
+        custom_hammer = "<:ban_hammer:1376542636126765107>" 
+
+        # Format SMP servers with custom bullet
+        smp_list = [f"• {smp}" for smp in smp_servers] if smp_servers else [f"{custom_bullet} Not in any SMP servers."]
+        embed1 = discord.Embed(title=f"{custom_checkmark} SMP Info for {user.name}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀", color=discord.Color.dark_embed())
+        embed1.set_footer(text=f"Page 1 | 2")
         embed1.add_field(
-            name="SMP Servers", 
-            value="\n".join(smp_servers) if smp_servers else "Not in any SMP servers.", 
+            name="SMP Servers",
+            value="\n\n".join(smp_list),
             inline=False
         )
 
-        embed2 = discord.Embed(title=f"Moderation Log for {user.name}", color=discord.Color.orange())
-        embed2.set_footer(text="Page 2/2")
+        embed2 = discord.Embed(title=f"{custom_hammer} Moderation Log for {user.name}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀", color=discord.Color.red())
+        embed2.set_footer(text=f"Page 2 | 2")
         embed2.add_field(
-            name="Logs", 
-            value="\n".join(user_logs) if user_logs else "No moderation logs found.", 
+            name="\nLogs",
+            value="\n\n".join(user_logs) if user_logs else "No moderation logs found.",
             inline=False
         )
 
         view = discord.ui.View()
-        left_button = discord.ui.Button(style=discord.ButtonStyle.primary, emoji="⬅️", disabled=True)
-        right_button = discord.ui.Button(style=discord.ButtonStyle.primary, emoji="➡️")
+        left_button = discord.ui.Button(style=discord.ButtonStyle.primary, emoji=discord.PartialEmoji.from_str(custom_left), disabled=True)
+        right_button = discord.ui.Button(style=discord.ButtonStyle.primary, emoji=discord.PartialEmoji.from_str(custom_right))
         view.add_item(left_button)
         view.add_item(right_button)
 
@@ -408,12 +422,12 @@ class ManageSMPServersCog(commands.Cog):
                 break
         
         if not target_server_id:
-            await interaction.followup.send(f"❌ SMP '{smp_name}' not found or not approved.", ephemeral=True)
+            await interaction.followup.send(f"<:no:1376542605885706351> SMP '{smp_name}' not found or not approved.", ephemeral=False)
             return
 
         guild = self.bot.get_guild(target_server_id)
         if not guild:
-            await interaction.followup.send(f"❌ Cannot access the SMP server.", ephemeral=True)
+            await interaction.followup.send(f"<:no:1376542605885706351> Cannot access the SMP server.", ephemeral=False)
             return
 
         role = None
@@ -431,8 +445,8 @@ class ManageSMPServersCog(commands.Cog):
             role_id = target_config.get("member_role_id", "Unknown")
             role_name = target_config.get("member_role_name", "SMP Member")
             await interaction.followup.send(
-                f"❌ SMP member role not found. Could not locate role with ID {role_id} or name '{role_name}' in the server.", 
-                ephemeral=True
+                f"<:no:1376542605885706351> SMP member role not found. Could not locate role with ID {role_id} or name '{role_name}' in the server.", 
+                ephemeral=False
             )
             return
 
@@ -463,10 +477,10 @@ class ManageSMPServersCog(commands.Cog):
         embed.set_footer(text=f"Server: {guild.name}")
         await interaction.followup.send(embed=embed)
 
-    @smp.command(name="setup", description="Set up your SMP server configuration")
+    @app_commands.command(name="setup", description="Set up your SMP server configuration")
     async def setup(self, interaction: discord.Interaction, smp_name: str):
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ You need administrator permissions to set up an SMP.", ephemeral=True)
+            await interaction.response.send_message("<:no:1376542605885706351> You need administrator permissions to set up an SMP.", ephemeral=True)
             return
 
         server_id = str(interaction.guild.id)
@@ -474,10 +488,10 @@ class ManageSMPServersCog(commands.Cog):
             existing_config = self.config["smp_configs"][server_id]
             embed = discord.Embed(
                 title="⚠️ SMP Already Configured",
-                description=f"This server already has an SMP configuration:\n\n**Name:** {existing_config['name']}\n**Member Role:** {existing_config.get('member_role_name', 'Unknown Role')}\n**Status:** {'✅ Approved' if existing_config.get('approved') else '⏳ Pending Approval'}",
+                description=f"This server already has an SMP configuration:\n\n**Name:** {existing_config['name']}\n**Member Role:** {existing_config.get('member_role_name', 'Unknown Role')}\n**Status:** {'<:yes:1376542481142911017> Approved' if existing_config.get('approved') else '⏳ Pending Approval'}",
                 color=discord.Color.orange()
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=False)
             return
 
         modal = SetupModal(self, smp_name)
@@ -487,22 +501,22 @@ class ManageSMPServersCog(commands.Cog):
     async def apply(self, interaction: discord.Interaction, smp_name: str):
         server_id = str(interaction.guild.id)
         if server_id not in self.config.get("smp_configs", {}):
-            await interaction.response.send_message("❌ This SMP is not set up yet. Use `/smp setup` first!", ephemeral=True)
+            await interaction.response.send_message("<:no:1376542605885706351> This SMP is not set up yet. Use `/smp setup` first!", ephemeral=False)
             return
 
         smp_config = self.config["smp_configs"][server_id]
         
         if smp_config.get("approved", False):
-            await interaction.response.send_message("✅ This SMP is already approved and listed!", ephemeral=True)
+            await interaction.response.send_message("<:yes:1376542481142911017> This SMP is already approved and listed!", ephemeral=False)
             return
 
         if smp_config["name"].lower() != smp_name.lower():
-            await interaction.response.send_message(f"❌ SMP name doesn't match. Configured name: **{smp_config['name']}**", ephemeral=True)
+            await interaction.response.send_message(f"<:no:1376542605885706351> SMP name doesn't match. Configured name: **{smp_config['name']}**", ephemeral=False)
             return
 
         smp_core_channel = self.bot.get_channel(SMP_CORE_CHANNEL_ID)
         if not smp_core_channel:
-            await interaction.response.send_message("❌ SMP Core channel not configured. Please contact an administrator.", ephemeral=True)
+            await interaction.response.send_message("<:no:1376542605885706351> SMP Core channel not configured. Please contact the developers.", ephemeral=True)
             return
 
         embed = discord.Embed(
@@ -527,12 +541,12 @@ class ManageSMPServersCog(commands.Cog):
         view = ApplicationView(self, application_data)
         await smp_core_channel.send(embed=embed, view=view)
 
-        await interaction.response.send_message("✅ Your SMP application has been submitted to SMP Core for review!", ephemeral=True)
+        await interaction.response.send_message("<:yes:1376542481142911017> Your SMP application has been submitted to SMP Core for review!", ephemeral=False)
 
-    @smp.command(name="add", description="Add an SMP server ID")
+    @smp.command(name="add", description="(Dev Command) Add an SMP server ID")
     async def add_smp_server(self, interaction: discord.Interaction, server_id: str):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You need to be an administrator to use this command.", ephemeral=True)
+        if interaction.user.id not in AUTHORIZED_USER_IDS:
+            await interaction.response.send_message("<:no:1376542605885706351> Unauthorized access.", ephemeral=True)
             return
 
         if not server_id.isdigit():
@@ -554,10 +568,10 @@ class ManageSMPServersCog(commands.Cog):
         logger.info(f"Added server ID {server_id} to smp_server_ids")
         await interaction.response.send_message(f"Added server ID {server_id} ({guild.name}) to the SMP list.", ephemeral=True)
 
-    @smp.command(name="remove", description="Remove an SMP server ID")
+    @smp.command(name="remove", description="(Dev Command) Remove an SMP server ID")
     async def remove_smp_server(self, interaction: discord.Interaction, server_id: str):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You need to be an administrator to use this command.", ephemeral=True)
+        if interaction.user.id not in AUTHORIZED_USER_IDS:
+            await interaction.response.send_message("<:no:1376542605885706351> Unauthorized access.", ephemeral=True)
             return
 
         if not server_id.isdigit():
@@ -574,10 +588,10 @@ class ManageSMPServersCog(commands.Cog):
         logger.info(f"Removed server ID {server_id} from smp_server_ids")
         await interaction.response.send_message(f"Removed server ID {server_id} from the SMP list.", ephemeral=True)
 
-    @smp.command(name="log", description="Add a log entry for a user")
+    @smp.command(name="log", description="(Dev Command) Add a log entry for a user")
     async def log_user(self, interaction: discord.Interaction, user: discord.User, server_id: str, log_entry: str):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You need to be an administrator to use this command.", ephemeral=True)
+        if interaction.user.id not in AUTHORIZED_USER_IDS:
+            await interaction.response.send_message("<:no:1376542605885706351> Unauthorized access.", ephemeral=True)
             return
 
         if not server_id.isdigit():
