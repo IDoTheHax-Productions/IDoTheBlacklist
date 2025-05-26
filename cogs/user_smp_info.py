@@ -283,6 +283,55 @@ class ManageSMPServersCog(commands.Cog):
                 })
         return approved_smps
 
+    # Event listener for member kicks
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        guild = member.guild
+        server_id = str(guild.id)
+        if server_id not in self.config.get("smp_server_ids", []):
+            return
+
+        # Check audit logs to confirm if this was a kick
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.kick):
+            if entry.target.id == member.id and (datetime.utcnow() - entry.created_at).total_seconds() < 60:
+                # Log the kick
+                user_id_str = str(member.id)
+                log_entry = f"Kicked by {entry.user.name} on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Reason: {entry.reason or 'No reason provided'})"
+                
+                if server_id not in self.config.get("user_logs", {}):
+                    self.config["user_logs"][server_id] = {}
+                if user_id_str not in self.config["user_logs"][server_id]:
+                    self.config["user_logs"][server_id][user_id_str] = []
+                
+                self.config["user_logs"][server_id][user_id_str].append(log_entry)
+                self.save_config()
+                logger.info(f"Logged kick for user {member.id} in server {server_id}: {log_entry}")
+                return
+
+    # Event listener for member bans
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild: discord.Guild, user: discord.User):
+        server_id = str(guild.id)
+        if server_id not in self.config.get("smp_server_ids", []):
+            return 
+
+        # Check audit logs to get ban details
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
+            if entry.target.id == user.id and (datetime.utcnow() - entry.created_at).total_seconds() < 60:
+                # Log the ban
+                user_id_str = str(user.id)
+                log_entry = f"Banned by {entry.user.name} on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Reason: {entry.reason or 'No reason provided'})"
+                
+                if server_id not in self.config.get("user_logs", {}):
+                    self.config["user_logs"][server_id] = {}
+                if user_id_str not in self.config["user_logs"][server_id]:
+                    self.config["user_logs"][server_id][user_id_str] = []
+                
+                self.config["user_logs"][server_id][user_id_str].append(log_entry)
+                self.save_config()
+                logger.info(f"Logged ban for user {user.id} in server {server_id}: {log_entry}")
+                return
+
     smp = app_commands.Group(name="smp", description="Manage SMP server IDs, roles, and user info")
 
     @smp.command(name="info", description="Show SMP and moderation info for a user")
